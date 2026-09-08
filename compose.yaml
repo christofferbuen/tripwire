@@ -113,6 +113,39 @@ services:
     networks:
       - tripwire
 
+  # Reverse DNS, scanner range lists and optional reputation verdicts for
+  # every address that appears in the indices. Same Python base as the
+  # receiver, script bind-mounted, no image to build. It needs egress: DNS,
+  # GitHub for the lists, and the two APIs when keys are configured.
+  enricher:
+    image: docker.io/library/python:3.14.7-alpine3.24
+    container_name: tripwire-enricher
+    command: ["python3", "/app/enrich.py"]
+    # Container root, like Vector: the secrets file is mode 600 and owned by
+    # the host user, which is who container root maps to under rootless
+    # podman. Read-only filesystem and no capabilities take care of the rest.
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    volumes:
+      - ./enrich.py:/app/enrich.py:ro,Z
+      # Same file Vector reads: the admin password, plus the API keys when
+      # ./setup-logging.sh found them in .env.
+      - ./vector-secrets.json:/run/secrets/tripwire.json:ro,Z
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 64
+    restart: unless-stopped
+    networks:
+      - tripwire
+
   opensearch:
     # 3.8.0 released 2026-08-04. Chosen over the 2.19.x maintenance line
     # because the Dashboards capabilities-route denial of service

@@ -139,17 +139,23 @@ VISUALISATIONS = [
     world_map("tw-map", "Where from"),
     table("tw-countries", "Countries", "source.geo.country_name"),
     table("tw-orgs", "Networks", "source.as.organization_name"),
+    # Filled in by enrich.py after the fact (reverse DNS, published lists)
+    # and by Vector at ingest (threat.tool from banners and user agents).
+    pie("tw-scanners", "Known scanners", "threat.scanner"),
+    pie("tw-tools", "Tools", "threat.tool"),
+    table("tw-lists", "On lists", "threat.lists"),
+    table("tw-ptr", "Reverse DNS", "source.domain", size=20),
 ]
 
 SEARCHES = [
     saved_search("tw-search-receiver", "Receiver hits", RECEIVER,
-                 ["source.ip", "source.geo.country_iso_code",
-                  "source.as.organization_name", "tier_name", "method", "path",
-                  "http.user_agent", "canary"]),
+                 ["source.ip", "source.domain", "source.geo.country_iso_code",
+                  "source.as.organization_name", "threat.scanner", "threat.tool",
+                  "tier_name", "method", "path", "http.user_agent", "canary"]),
     saved_search("tw-search-sentinel", "Sentinel connections", SENTINEL,
-                 ["source.ip", "source.geo.country_iso_code",
-                  "source.as.organization_name", "port", "role",
-                  "classification", "http.user_agent", "ssh_client",
+                 ["source.ip", "source.domain", "source.geo.country_iso_code",
+                  "source.as.organization_name", "threat.scanner", "threat.tool",
+                  "port", "role", "classification", "ssh_client",
                   "distinct_ports"]),
 ]
 
@@ -165,7 +171,11 @@ LAYOUT = [
     ("tw-paths", 0, 46, 16, 16),
     ("tw-ports", 16, 46, 16, 16),
     ("tw-canaries", 32, 46, 16, 16),
-    ("tw-agents", 0, 62, 48, 14),
+    ("tw-scanners", 0, 62, 12, 16),
+    ("tw-tools", 12, 62, 12, 16),
+    ("tw-lists", 24, 62, 12, 16),
+    ("tw-ptr", 36, 62, 12, 16),
+    ("tw-agents", 0, 78, 48, 14),
 ]
 
 

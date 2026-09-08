@@ -74,8 +74,15 @@ for line in open(env_path, encoding="utf-8"):
 password = env.get("OPENSEARCH_INITIAL_ADMIN_PASSWORD")
 if not password:
     sys.exit(f"OPENSEARCH_INITIAL_ADMIN_PASSWORD is missing from {env_path}")
+secrets = {"opensearch_password": password}
+# Optional. enrich.py asks GreyNoise and AbuseIPDB about each address when
+# these are present in .env and skips them when they are not.
+for env_key, out_key in (("GREYNOISE_API_KEY", "greynoise_api_key"),
+                         ("ABUSEIPDB_API_KEY", "abuseipdb_api_key")):
+    if env.get(env_key):
+        secrets[out_key] = env[env_key]
 with open(out_path, "w", encoding="utf-8") as fh:
-    json.dump({"opensearch_password": password}, fh)
+    json.dump(secrets, fh)
 PY
 chmod 600 "$SECRETS_FILE"
 echo "Wrote $SECRETS_FILE with mode 600, matching $ENV_FILE."

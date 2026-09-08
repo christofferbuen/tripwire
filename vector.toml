@@ -118,6 +118,10 @@ for_each(headers) -> |k, v| {
   "sec_fetch_mode":  get(lower, ["sec-fetch-mode"]) ?? null,
   "sec_fetch_dest":  get(lower, ["sec-fetch-dest"]) ?? null,
   "cf_connecting_ip": get(lower, ["cf-connecting-ip"]) ?? null,
+  # Set by Cloudflare on the way in: the edge's own country verdict and the
+  # request id you can paste into the Cloudflare dashboard.
+  "cf_ipcountry":     get(lower, ["cf-ipcountry"]) ?? null,
+  "cf_ray":           get(lower, ["cf-ray"]) ?? null,
   "x_forwarded_for":  get(lower, ["x-forwarded-for"]) ?? null,
   "header_count": length(headers),
   "headers_raw": encode_json(headers)
@@ -131,6 +135,38 @@ del(.user_agent)
 
 .source = { "ip": .ip }
 del(.ip)
+
+# Which tool this looks like, from what the client volunteered. Local and
+# cheap; enrich.py adds who owns the address afterwards. An honest name in
+# the user agent beats a guess from the path, so the agent checks come first.
+# The user-agent half is duplicated in vector-sentinel.toml; keep them in step.
+ua = downcase(string(.http.user_agent) ?? "")
+path = downcase(string(.path) ?? "")
+tool = if contains(ua, "zgrab") { "zgrab"
+} else if contains(ua, "censysinspect") { "censys"
+} else if contains(ua, "expanse") || contains(ua, "paloaltonetworks") { "xpanse"
+} else if contains(ua, "internetmeasurement") { "driftnet"
+} else if contains(ua, "security.ipip.net") { "ipip"
+} else if contains(ua, "leakix") || contains(ua, "l9explore") { "leakix"
+} else if contains(ua, "getodin") || starts_with(ua, "odin") { "odin"
+} else if contains(ua, "modat") { "modat"
+} else if contains(ua, "nuclei") { "nuclei"
+} else if contains(ua, "masscan") { "masscan"
+} else if contains(ua, "nmap") { "nmap"
+} else if contains(ua, "zmap") { "zmap"
+} else if contains(ua, "go-http-client") { "go-http"
+} else if contains(ua, "python") || contains(ua, "aiohttp") { "python"
+} else if starts_with(ua, "curl/") { "curl"
+} else if starts_with(ua, "wget/") { "wget"
+} else if contains(ua, "libwww-perl") { "perl"
+} else if contains(ua, "fasthttp") { "fasthttp"
+} else if contains(ua, "hello world") || contains(ua, "hello, world") { "hello-world"
+} else if contains(path, "/boaform/") { "boa-router-exploit"
+} else if contains(path, "gponform") || contains(path, "/hnap1") || contains(path, "/cgi-bin/luci") || contains(path, "setup.cgi") || contains(path, "/shell") { "iot-exploit"
+} else if contains(path, "/.env") || contains(path, "/.git") || contains(path, "/.aws") || contains(path, "phpinfo") { "secret-file-probe"
+} else if contains(path, "wp-") || contains(path, "xmlrpc.php") { "wordpress-probe"
+} else { null }
+if tool != null { .threat = { "tool": tool } }
 '''
 
 # --------------------------------------------------------------------------

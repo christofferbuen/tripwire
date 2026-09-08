@@ -223,8 +223,43 @@ api PUT /_index_template/tripwire "$(cat <<'EOF'
                 "asn":               { "type": "keyword" },
                 "organization_name": { "type": "keyword" }
               }
+            },
+            "domain": { "type": "keyword" }
+          }
+        },
+
+        "threat": {
+          "properties": {
+            "tool":        { "type": "keyword" },
+            "scanner":     { "type": "keyword" },
+            "lists":       { "type": "keyword" },
+            "ipsum_score": { "type": "integer" }
+          }
+        },
+        "reputation": {
+          "properties": {
+            "greynoise": {
+              "properties": {
+                "noise":          { "type": "boolean" },
+                "riot":           { "type": "boolean" },
+                "classification": { "type": "keyword" },
+                "name":           { "type": "keyword" },
+                "last_seen":      { "type": "date", "ignore_malformed": true }
+              }
+            },
+            "abuseipdb": {
+              "properties": {
+                "score":      { "type": "integer" },
+                "reports":    { "type": "integer" },
+                "usage_type": { "type": "keyword" },
+                "domain":     { "type": "keyword" },
+                "is_tor":     { "type": "boolean" }
+              }
             }
           }
+        },
+        "enrichment": {
+          "properties": { "at": { "type": "date" } }
         },
 
         "tier":      { "type": "integer" },
@@ -252,6 +287,8 @@ api PUT /_index_template/tripwire "$(cat <<'EOF'
             "sec_fetch_mode":  { "type": "keyword" },
             "sec_fetch_dest":  { "type": "keyword" },
             "cf_connecting_ip":{ "type": "ip", "ignore_malformed": true },
+            "cf_ipcountry":    { "type": "keyword" },
+            "cf_ray":          { "type": "keyword" },
             "x_forwarded_for": { "type": "keyword", "ignore_above": 1024 },
             "header_count":    { "type": "integer" },
             "headers_raw":     { "type": "text", "index": true }
@@ -292,10 +329,22 @@ echo "  done"
 # that is fine, they are on their way out.
 if api GET "/_cat/indices/tripwire-*?h=index" | grep -q tripwire; then
   api PUT "/tripwire-*/_settings" '{"index.default_pipeline":"tripwire-enrich"}' > /dev/null || true
-  api PUT "/tripwire-*/_mapping" '{"properties":{"source":{"properties":{
-    "geo":{"properties":{"country_iso_code":{"type":"keyword"},"country_name":{"type":"keyword"},
-           "city_name":{"type":"keyword"},"location":{"type":"geo_point","ignore_malformed":true}}},
-    "as":{"properties":{"asn":{"type":"keyword"},"organization_name":{"type":"keyword"}}}}}}}' > /dev/null || true
+  api PUT "/tripwire-*/_mapping" '{"properties":{
+    "source":{"properties":{
+      "geo":{"properties":{"country_iso_code":{"type":"keyword"},"country_name":{"type":"keyword"},
+             "city_name":{"type":"keyword"},"location":{"type":"geo_point","ignore_malformed":true}}},
+      "as":{"properties":{"asn":{"type":"keyword"},"organization_name":{"type":"keyword"}}},
+      "domain":{"type":"keyword"}}},
+    "http":{"properties":{"cf_ipcountry":{"type":"keyword"},"cf_ray":{"type":"keyword"}}},
+    "threat":{"properties":{"tool":{"type":"keyword"},"scanner":{"type":"keyword"},
+              "lists":{"type":"keyword"},"ipsum_score":{"type":"integer"}}},
+    "reputation":{"properties":{
+      "greynoise":{"properties":{"noise":{"type":"boolean"},"riot":{"type":"boolean"},
+                   "classification":{"type":"keyword"},"name":{"type":"keyword"},
+                   "last_seen":{"type":"date","ignore_malformed":true}}},
+      "abuseipdb":{"properties":{"score":{"type":"integer"},"reports":{"type":"integer"},
+                   "usage_type":{"type":"keyword"},"domain":{"type":"keyword"},"is_tor":{"type":"boolean"}}}}},
+    "enrichment":{"properties":{"at":{"type":"date"}}}}}' > /dev/null || true
 fi
 
 echo "Creating the sentinel write alias."
@@ -339,16 +388,25 @@ dash() {
 # With its field list filled in. A pattern saved without one has an empty
 # field cache, and every visualisation fails with "Could not locate that
 # index-pattern-field (id: @timestamp)" until somebody presses refresh.
-pattern_doc() {
-  curl -sS "${DASH_URL}/api/index_patterns/_fields_for_wildcard?pattern=tripwire-*&meta_fields=_source&meta_fields=_id&meta_fields=_index&meta_fields=_score" \
+pattern_doc() {  # $1 index pattern, $2 time field
+  curl -sS "${DASH_URL}/api/index_patterns/_fields_for_wildcard?pattern=$1&meta_fields=_source&meta_fields=_id&meta_fields=_index&meta_fields=_score" \
     -u "admin:${OS_PASS}" -H 'securitytenant: global' \
     | python3 -c 'import sys, json
 fields = json.dumps(json.load(sys.stdin)["fields"])
-print(json.dumps({"attributes": {"title": "tripwire-*", "timeFieldName": "@timestamp", "fields": fields}}))'
+print(json.dumps({"attributes": {"title": sys.argv[1], "timeFieldName": sys.argv[2], "fields": fields}}))' "$1" "$2"
 }
-dash POST '/api/saved_objects/index-pattern/tripwire?overwrite=true' "$(pattern_doc)" > /dev/null \
+dash POST '/api/saved_objects/index-pattern/tripwire?overwrite=true' "$(pattern_doc 'tripwire-*' '@timestamp')" > /dev/null \
   && dash POST /api/opensearch-dashboards/settings '{"changes":{"defaultIndex":"tripwire"}}' > /dev/null \
   && echo "  done" || echo "  skipped (Dashboards not reachable at ${DASH_URL})"
+# One document per address, written by the enricher container. It creates
+# the index itself on its first start, so this is only skipped on a cold
+# bootstrap; the next run picks it up.
+if api GET "/_cat/indices/address-book?h=index" | grep -qx address-book; then
+  dash POST '/api/saved_objects/index-pattern/address-book?overwrite=true' "$(pattern_doc 'address-book' 'checked')" > /dev/null \
+    && echo "  address-book pattern done"
+else
+  echo "  address-book index not there yet (enricher not started?), pattern skipped"
+fi
 
 echo "Importing the overview dashboard."
 python3 "$(dirname "$0")/dashboards.py" > /tmp/tripwire-dashboards.ndjson

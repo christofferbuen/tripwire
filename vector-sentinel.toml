@@ -68,6 +68,51 @@ del(.ip)
 del(.http_user_agent)
 del(.http_host)
 
+# Which tool this looks like, from what the client volunteered. The SSH
+# banner is the most honest signal: Go's ssh library announces itself as
+# exactly "SSH-2.0-Go", and the "PUTTY" spelling is a brute-forcer imitating
+# PuTTY, which writes "PuTTY_Release". The user-agent half is duplicated in
+# vector.toml; keep them in step. enrich.py adds who owns the address later.
+ssh = string(.ssh_client) ?? ""
+ua = downcase(string(.http.user_agent) ?? "")
+paths = downcase(join(array(.http_requests) ?? [], " ") ?? "")
+tool = if ssh == "SSH-2.0-Go" { "go-ssh"
+} else if contains(ssh, "PUTTY") { "fake-putty"
+} else if contains(ssh, "PuTTY") { "putty"
+} else if contains(ssh, "ZGrab") || contains(ua, "zgrab") { "zgrab"
+} else if contains(ssh, "libssh") { "libssh"
+} else if contains(ssh, "paramiko") { "paramiko"
+} else if contains(ssh, "Nmap") || contains(ua, "nmap") { "nmap"
+} else if contains(ssh, "OpenSSH") { "openssh"
+} else if contains(ssh, "JSCH") { "jsch"
+} else if contains(ssh, "AsyncSSH") { "asyncssh"
+} else if contains(ssh, "Ruby/Net::SSH") { "ruby-net-ssh"
+} else if contains(ssh, "sshlib") { "sshlib"
+} else if ssh != "" { "ssh-other"
+} else if contains(ua, "censysinspect") { "censys"
+} else if contains(ua, "expanse") || contains(ua, "paloaltonetworks") { "xpanse"
+} else if contains(ua, "internetmeasurement") { "driftnet"
+} else if contains(ua, "security.ipip.net") { "ipip"
+} else if contains(ua, "leakix") || contains(ua, "l9explore") { "leakix"
+} else if contains(ua, "getodin") || starts_with(ua, "odin") { "odin"
+} else if contains(ua, "modat") { "modat"
+} else if contains(ua, "nuclei") { "nuclei"
+} else if contains(ua, "masscan") { "masscan"
+} else if contains(ua, "zmap") { "zmap"
+} else if contains(ua, "go-http-client") { "go-http"
+} else if contains(ua, "python") || contains(ua, "aiohttp") { "python"
+} else if starts_with(ua, "curl/") { "curl"
+} else if starts_with(ua, "wget/") { "wget"
+} else if contains(ua, "libwww-perl") { "perl"
+} else if contains(ua, "fasthttp") { "fasthttp"
+} else if contains(ua, "hello world") || contains(ua, "hello, world") { "hello-world"
+} else if contains(paths, "/boaform/") { "boa-router-exploit"
+} else if contains(paths, "gponform") || contains(paths, "/hnap1") || contains(paths, "/cgi-bin/luci") || contains(paths, "setup.cgi") || contains(paths, "/shell") { "iot-exploit"
+} else if contains(paths, "/.env") || contains(paths, "/.git") || contains(paths, "/.aws") || contains(paths, "phpinfo") { "secret-file-probe"
+} else if contains(paths, "wp-") || contains(paths, "xmlrpc.php") { "wordpress-probe"
+} else { null }
+if tool != null { .threat = { "tool": tool } }
+
 # A connection that completed the handshake and then said nothing is a
 # scanner confirming the port is open. One that spoke the protocol is trying
 # to use the service. One that spoke while we had already decided it was

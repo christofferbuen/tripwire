@@ -208,6 +208,36 @@ downloaded to the cluster and refreshed every three days; lookups are local,
 so no address is ever sent anywhere. Fields land under `source.geo.*` and
 `source.as.*`.
 
+Three more things are added after the fact by the `enricher` container
+(`enrich.py`, stdlib only), which polls for addresses without an
+`enrichment.at` mark once a minute, looks each one up once, and copies the
+answer onto every event from that address:
+
+- **Reverse DNS** in `source.domain`. A PTR that ends in a known scanner
+  domain (`censys-scanner.com`, `shadowserver.org`, `stretchoid.com`, ...)
+  also names it in `threat.scanner`.
+- **Published lists** in `threat.lists`, and `threat.scanner` when one of
+  them is a scanning organisation. Sources: the per-organisation CIDR files
+  from OpenFilters/internet-scanners (Censys, Shodan, Stretchoid, BinaryEdge,
+  Shadowserver, Driftnet, Xpanse, and sixty-odd more), the FireHOL sets
+  `maltrail_scanners`, `level1`, `blocklist_de`, `greensnow` and `dshield`,
+  and IPsum, whose count of agreeing blocklists lands in
+  `threat.ipsum_score` when it is three or more. Refreshed daily; a failed
+  refresh keeps the previous copy.
+- **Reputation** in `reputation.greynoise.*` and `reputation.abuseipdb.*`,
+  only when `GREYNOISE_API_KEY` or `ABUSEIPDB_API_KEY` is in `.env` before
+  `setup-logging.sh` runs. Both free tiers are quota-limited; a 429 pauses
+  that API for an hour. Note these two do send the attacker's address to a
+  third party, which is why they are opt-in.
+
+The per-address answers are cached in the `address-book` index (one document
+per address, re-checked weekly), which the bootstrap also exposes as a
+Dashboards index pattern. Vector adds `threat.tool` at ingest from what the
+client volunteered: SSH banners (`SSH-2.0-Go`, the fake `PUTTY`), user
+agents (ZGrab, CensysInspect, Nuclei, masscan, ...) and tell-tale paths
+(`/boaform/`, `/.env`). Cloudflare's own `Cf-Ipcountry` and `Cf-Ray` are
+kept as `http.cf_ipcountry` and `http.cf_ray` on receiver hits.
+
 `bootstrap-opensearch.sh` also creates the `tripwire` index pattern and
 imports the "Tripwire overview" dashboard, which `dashboards.py` generates.
 Both go into the Global tenant, so every login sees them. Edit
