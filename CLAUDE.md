@@ -93,3 +93,17 @@ canary, agent, both, returned, novel-fingerprint (high channel);
 sentinel-silent 60 min and receiver-silent 30 min dead-man switches; digest
 07:00 `DIGEST_TZ` (low channel). `novel-fingerprint` is noisy for the first
 days after a fresh `fingerprint-book`; that is expected, not a bug.
+
+## Roadmap
+
+- **Sentinel PTR record.** Hetzner Cloud console → the VM → Networking →
+  Primary IPs → edit reverse DNS. Pick a dull name that matches the persona
+  (a `mail.` or `www.` under a domain that is not the operator's), and make
+  the forward A record agree, so a scanner's lookup does not stand out.
+- **Certificate for 443 on the sentinel.** Wakes JA4: `do_https` already
+  does a real handshake once `TLS_CERT`/`TLS_KEY` exist. Needs a hostname
+  pointing at the VM (see PTR), then a Let's Encrypt cert obtained on the VM
+  and bind-mounted into the container. Self-signed is fine for the
+  fingerprint itself, but a real cert makes the persona hold up.
+- Optional: GreyNoise / AbuseIPDB keys in the collector `.env` for
+  reputation enrichment.
