@@ -1,0 +1,41 @@
+# Never bake collected hit data into an image layer.
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+test.sqlite3*
+tarpit-test.sqlite3*
+*.jsonl
+*.jsonl.1
+identity.json
+
+# Never bake the OpenSearch admin password into an image layer either. It
+# lives in two places: .env for compose and OpenSearch, and the secrets file
+# Vector reads. Both are mode 600 and neither is ever committed.
+.env
+*secrets.json
+
+.git
+.gitignore
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+README.md
+*.local.*
+allowlist.example.json
+ssh-allowlist.json
+build-ssh-allowlist.py
+compose.yaml
+run.sh
+setup-logging.sh
+tripwire.container
+sentinel.container
+payload.html
+render-payload.py
+profile-block*.html
+vector.toml
+vector-sentinel.toml
+compose.sentinel.yaml
+bootstrap-opensearch.sh
+Containerfile.sentinel

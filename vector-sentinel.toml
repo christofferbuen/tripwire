@@ -1,0 +1,123 @@
+# Vector 0.58.0 on the sentinel host.
+#
+# Ships to the collector over a private link. Both the endpoint and the
+# password come from the secrets file rather than being written here, because
+# they are site-specific. A public address would be a mistake: OpenSearch is
+# bound to loopback on the collector and should be reached over WireGuard or
+# Tailscale, not over the internet.
+#
+# The endpoint is not a secret. It travels through the same backend because
+# Vector 0.57 disabled `${VAR}` interpolation in configuration files, so the
+# secrets backend is now the only supported way to keep a per-host value out
+# of a file that is committed. Getting this wrong is quiet rather than loud:
+# an uninterpolated `${VAR}` is passed through verbatim, which for a password
+# means every write is rejected with 401.
+#
+# The disk buffer matters more here than on the collector. The link between
+# the two hosts is a network that can go away, and a sensor whose shipper
+# drops events during an outage is blind exactly when something interesting
+# is happening. With acknowledgements on and the buffer blocking when full,
+# an outage costs latency: Vector fills the buffer, stops advancing its read
+# checkpoint, and the lines wait in the file until the link is back.
+
+data_dir = "/var/lib/vector"
+
+[api]
+enabled = false
+
+[secret.local]
+type = "file"
+path = "/etc/vector/secrets.json"
+
+[sources.sentinel]
+type = "file"
+include = ["/var/log/sentinel/connections.jsonl"]
+read_from = "beginning"
+fingerprint.strategy = "checksum"
+fingerprint.lines = 1
+max_line_bytes = 65536
+
+[transforms.sentinel_events]
+type = "remap"
+inputs = ["sentinel"]
+drop_on_error = true
+reroute_dropped = true
+source = '''
+parsed = object!(parse_json!(.message))
+del(.message)
+. = merge(., parsed)
+
+."@timestamp" = .ts
+del(.ts)
+.event = {
+  "kind": "event",
+  "dataset": "tripwire.sentinel",
+  "module": "sentinel",
+  "ingested": .timestamp
+}
+.log = { "file": { "path": .file } }
+del(.timestamp)
+del(.file)
+del(.host)
+del(.source_type)
+.source = { "ip": .ip }
+del(.ip)
+
+# A connection that completed the handshake and then said nothing is a
+# scanner confirming the port is open. One that spoke the protocol is trying
+# to use the service. One that spoke while we had already decided it was
+# sweeping is doing both.
+#
+# Not every line is a connection. The sentinel also emits a one-off summary
+# when an address first crosses the sweep threshold, and a marker when it
+# sheds a connection at capacity. Neither carries a port, so both have to be
+# taken out before the spoke/sweeping test, or they get filed as a scanner
+# confirming a port that is not in the record.
+kind = string(.kind) ?? "connect"
+outcome = string(.outcome) ?? ""
+spoke = bool(.spoke) ?? false
+sweeping = bool(.sweeping) ?? false
+.classification = if kind == "sweep" {
+  "sweep-detected"
+} else if outcome == "shed-load" {
+  "shed-load"
+} else if !spoke {
+  "port-confirm"
+} else if sweeping {
+  "sweep-interaction"
+} else {
+  "service-interaction"
+}
+'''
+
+[sinks.opensearch_sentinel]
+type = "elasticsearch"
+inputs = ["sentinel_events"]
+endpoints = ["SECRET[local.opensearch_endpoint]"]
+api_version = "v7"
+mode = "bulk"
+bulk.index = "tripwire-sentinel-%Y.%m.%d"
+auth.strategy = "basic"
+auth.user = "admin"
+auth.password = "SECRET[local.opensearch_password]"
+# The cluster uses self-signed demo certificates and is reached over a
+# private encrypted link, which is what is actually protecting this traffic.
+# Issue real certificates and turn these back on if that stops being true.
+tls.verify_certificate = false
+tls.verify_hostname = false
+acknowledgements.enabled = true
+batch.timeout_secs = 10
+
+[sinks.opensearch_sentinel.buffer]
+type = "disk"
+# Larger than the collector's, because this one has a network between it and
+# the destination. At roughly 400 bytes an event this holds several million
+# connections, which is more outage than a sensor is likely to survive.
+max_size = 1073741824
+when_full = "block"
+
+[sinks.parse_failures]
+type = "console"
+inputs = ["sentinel_events.dropped"]
+target = "stderr"
+encoding.codec = "json"

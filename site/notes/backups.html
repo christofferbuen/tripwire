@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Notes on backups that actually restore &mdash; Notes</title>
+<link rel="stylesheet" href="/static/css/site.css">
+<link rel="icon" href="/static/img/logo.svg" type="image/svg+xml">
+</head>
+<body>
+
+<header class="masthead">
+  <h1><a href="/">Notes</a></h1>
+  <p class="sub">Occasional writing. Mostly unfinished.</p>
+  <nav>
+    <a href="/">Writing</a>
+    <a href="/about">About</a>
+    <a href="/contact">Contact</a>
+  </nav>
+</header>
+
+<main class="post">
+  <h1>Notes on backups that actually restore</h1>
+  <time datetime="2025-11-02">2 November 2025</time>
+
+  <p>A backup you have never restored from is a hypothesis, not a backup.
+  Test the restore on a schedule or accept that you do not have one.</p>
+
+  <p>The failures I have actually hit were never the copy step. They were a
+  key nobody could find, an archive that unpacked into the wrong root, and
+  one memorable case where the job had been writing zero-byte files nightly
+  for five months while reporting success.</p>
+
+  <p>That last one is the argument for checking size and content rather than
+  exit status. A job that cannot fail is not reliable. It is unmonitored.</p>
+
+</main>
+
+<footer>
+  <a href="/">Back to writing</a>
+</footer>
+
+<script src="/static/js/site.js"></script>
+</body>
+</html>

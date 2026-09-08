@@ -1,0 +1,43 @@
+# Port-scan sentinel.
+#
+# Same base as the receiver, same reasoning: CPython 3.14.7 on Alpine 3.24,
+# chosen 2026-09-08. 3.14.7 is a security release closing tarfile extraction
+# filter path-traversal bypasses and scoping HTTPPasswordMgr credentials to
+# the URL scheme (CVE-2026-15806), and it bundles libexpat 2.8.1
+# (CVE-2026-45186) and pip 26.1 (CVE-2026-3219). Python 3.15 was still at
+# release candidate on that date.
+#
+# The application imports nothing outside the standard library.
+#
+# Build:  podman build -f Containerfile.sentinel -t localhost/sentinel:latest .
+
+FROM docker.io/library/python:3.14.7-alpine3.24
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN addgroup -S -g 10002 sentinel \
+ && adduser -S -u 10002 -G sentinel -H -s /sbin/nologin sentinel \
+ && mkdir -p /var/log/sentinel \
+ && chown 10002:10002 /var/log/sentinel
+
+WORKDIR /app
+COPY sentinel.py /app/
+RUN chmod 0444 /app/sentinel.py
+
+USER 10002:10002
+
+VOLUME ["/var/log/sentinel"]
+
+# The persona decides which ports open, so nothing is EXPOSEd here. Declaring
+# a port list in the image that disagrees with the running persona is exactly
+# the kind of inconsistency the program exists to avoid.
+
+ENTRYPOINT ["python3", "/app/sentinel.py"]
+
+# 0.0.0.0 is the container's own namespace. Which ports actually face the
+# internet is decided by how they are published. Unlike the receiver, this
+# service is meant to be reachable: that is the entire point of it. It must
+# therefore live on a host that holds nothing else.
+CMD ["--host", "0.0.0.0", "--persona", "ubuntu-web", \
+     "--log", "/var/log/sentinel/connections.jsonl"]

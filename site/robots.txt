@@ -1,0 +1,11 @@
+# Nothing here is worth indexing.
+
+User-agent: *
+Disallow: /archive/
+Disallow: /contact
+
+# The Disallow above is the labyrinth's front door, and it is the only place
+# it is advertised. Nothing on this site links to /archive/. A well-behaved
+# crawler reads this file and stays out. A client that reads this file and
+# then walks straight into the directory it was just told to avoid has made
+# a choice, and that choice is the finding.

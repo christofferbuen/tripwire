@@ -1,0 +1,39 @@
+# Cloudflare Tunnel config for the tripwire receiver.
+#
+# Named tunnel, not a quick tunnel. A quick tunnel's trycloudflare.com
+# hostname changes on every restart, which silently breaks the URL baked
+# into the profile page. Named tunnels keep the hostname.
+#
+# Setup, once:
+#   cloudflared tunnel login
+#   cloudflared tunnel create tripwire
+#   cloudflared tunnel route dns tripwire notes.YOURDOMAIN.TLD
+#   cp cloudflared-config.yml ~/.cloudflared/config.yml   # then edit
+#   cloudflared tunnel run tripwire
+#
+# As a service, so it survives reboots:
+#   sudo cloudflared service install
+#
+# Note what this buys and what it costs. No inbound firewall hole and the
+# origin address is never exposed. In exchange Cloudflare terminates TLS
+# and sees every canary hit, so a third party holds a copy of your
+# detection data. That was a deliberate choice, not an oversight.
+
+tunnel: tripwire
+credentials-file: /home/YOURUSER/.cloudflared/TUNNEL-UUID.json
+
+# Keep the tunnel from advertising what it is.
+originRequest:
+  noTLSVerify: false
+  connectTimeout: 10s
+  # The receiver sets its own Server header. Do not let cloudflared add
+  # anything that marks the origin as a tunnel.
+  disableChunkedEncoding: false
+
+ingress:
+  - hostname: notes.YOURDOMAIN.TLD
+    service: http://127.0.0.1:8787
+
+  # Everything else is refused rather than forwarded. Without this the
+  # tunnel would happily proxy any hostname pointed at it.
+  - service: http_status:404

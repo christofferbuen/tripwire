@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "Copy to allowlist.local.json and replace the ASNs. That file is untracked:",
+    "which networks you administer from is a fact about you, not about the tool.",
+    "",
+    "The numbers below are from RFC 5398 and are reserved for documentation.",
+    "They announce nothing, so the script will refuse to build from this file.",
+    "",
+    "Source real ASNs from a per-country eyeball ranking rather than memory, and",
+    "confirm each holder before trusting it: allocations change hands and stale",
+    "notes outlive them. Rankings order by residential users, so a network you",
+    "only use during the working day may not appear at all and must be added by",
+    "hand.",
+    "",
+    "Keep the set small. Two or three ASNs is a tighter control than a whole",
+    "country and costs a fraction of the firewall's entry budget."
+  ],
+
+  "asns": {
+    "64496": "home ISP",
+    "64497": "the network you work from"
+  },
+
+  "optional": {
+    "64498": "mobile carrier, included only with --with-mobile"
+  }
+}

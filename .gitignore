@@ -1,0 +1,42 @@
+# git does not read .containerignore. The two files overlap heavily and both
+# have to be kept correct; a rule added to one is not a rule added to the other.
+
+# Collected data. Nothing an attacker touched belongs in version control:
+# it is third-party personal data, and it is evidence.
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.jsonl
+*.jsonl.*
+identity.json
+
+# Credentials. The OpenSearch password lives in .env for compose and in the
+# secrets files for Vector. Neither is ever committed.
+.env
+*secrets.json
+*.key
+*.pem
+*.pub
+
+# Rendered output carries the live hostname, which is the one string the
+# whole design depends on not being searchable.
+profile-block*.html
+
+# Anything target-specific. This repository is a generic tool; which profile
+# page is instrumented, which hosts run it and which networks you administer
+# from are facts about a deployment. Committing them turns the tool into a
+# description of one specific operation, including in the history, where it is
+# awkward to remove later.
+#
+#   hosts.local.md         the two hosts, addresses, decisions
+#   allowlist.local.json   the ASNs you connect from
+*.local.*
+
+# Generated, not authored. Rebuild with ./build-ssh-allowlist.py
+ssh-allowlist.json
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store

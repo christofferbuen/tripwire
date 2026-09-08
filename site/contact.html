@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Contact &mdash; Notes</title>
+<link rel="stylesheet" href="/static/css/site.css">
+<link rel="icon" href="/static/img/logo.svg" type="image/svg+xml">
+</head>
+<body>
+
+<header class="masthead">
+  <h1><a href="/">Notes</a></h1>
+  <p class="sub">Occasional writing. Mostly unfinished.</p>
+  <nav>
+    <a href="/">Writing</a>
+    <a href="/about">About</a>
+    <a href="/contact">Contact</a>
+  </nav>
+</header>
+
+<main class="post">
+  <h1>Contact</h1>
+  <p>Messages get read when I get to them. No promises about speed.</p>
+
+  <form method="post" action="/contact">
+    <label for="message">Message</label>
+    <textarea id="message" name="message" rows="7"></textarea>
+
+    <!-- Spam trap. A person never sees this and never fills it in, so
+         anything arriving with it populated was filled by a machine
+         walking the form. Positioned off-screen rather than hidden with
+         display:none, because plenty of bots skip display:none fields. -->
+    <div class="hp" aria-hidden="true">
+      <label for="website">Website</label>
+      <input type="text" id="website" name="website" tabindex="-1" autocomplete="off">
+    </div>
+
+    <button type="submit">Send</button>
+  </form>
+</main>
+
+<footer>
+  <a href="/">Back to writing</a>
+</footer>
+
+<script src="/static/js/site.js"></script>
+</body>
+</html>

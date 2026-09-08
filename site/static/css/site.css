@@ -1,0 +1,91 @@
+/* Deliberately plain. A hand-rolled stylesheet on a personal blog should
+   look hand-rolled: no framework, no build step, a few opinions. */
+
+:root {
+    --ink: #24221f;
+    --muted: #8a8579;
+    --rule: #e6e2d9;
+    --paper: #fdfcf9;
+    --link: #4a5a3f;
+}
+
+* { box-sizing: border-box; }
+
+body {
+    max-width: 38rem;
+    margin: 0 auto;
+    padding: 3.5rem 1.5rem 6rem;
+    font: 16px/1.65 Georgia, "Iowan Old Style", serif;
+    color: var(--ink);
+    background: var(--paper);
+    -webkit-text-size-adjust: 100%;
+}
+
+a { color: var(--link); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+a:hover { color: var(--ink); }
+
+header.masthead { margin-bottom: 3rem; }
+header.masthead h1 { font-size: 1.35rem; font-weight: normal; margin: 0; letter-spacing: .01em; }
+header.masthead h1 a { color: var(--ink); text-decoration: none; }
+.sub { color: var(--muted); font-size: .85rem; margin: .25rem 0 0; }
+
+nav { margin-top: 1rem; font-size: .85rem; }
+nav a { margin-right: 1rem; }
+
+article { margin: 0 0 2.5rem; }
+article h2 { font-size: 1.08rem; font-weight: normal; margin: 0 0 .15rem; }
+article h2 a { text-decoration: none; }
+article h2 a:hover { text-decoration: underline; }
+article p { margin: .4rem 0 0; }
+
+time { color: var(--muted); font-size: .78rem; letter-spacing: .03em; text-transform: uppercase; }
+
+.post h1 { font-size: 1.25rem; font-weight: normal; margin: 0 0 .2rem; }
+.post p { margin: 1rem 0; }
+.post blockquote {
+    margin: 1.4rem 0;
+    padding-left: 1rem;
+    border-left: 2px solid var(--rule);
+    color: #55514a;
+}
+
+label { display: block; font-size: .85rem; color: var(--muted); margin-bottom: .3rem; }
+textarea, input[type=text] {
+    width: 100%;
+    font: inherit;
+    font-size: .95rem;
+    padding: .5rem;
+    border: 1px solid var(--rule);
+    background: #fff;
+    border-radius: 2px;
+}
+button {
+    font: inherit;
+    font-size: .9rem;
+    padding: .45rem 1.1rem;
+    margin-top: .8rem;
+    border: 1px solid var(--rule);
+    background: #f4f1ea;
+    border-radius: 2px;
+    cursor: pointer;
+}
+button:hover { background: #ece8df; }
+
+/* The contact form's spam trap. Kept out of the flow rather than
+   display:none, because some bots skip anything display:none. */
+.hp {
+    position: absolute;
+    left: -9999px;
+    top: -9999px;
+    height: 0;
+    overflow: hidden;
+}
+
+footer {
+    margin-top: 4rem;
+    padding-top: 1.2rem;
+    border-top: 1px solid var(--rule);
+    color: var(--muted);
+    font-size: .8rem;
+}
+footer a { color: var(--muted); }

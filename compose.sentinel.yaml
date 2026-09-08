@@ -1,0 +1,136 @@
+# The port-scan sentinel. This runs on a DIFFERENT HOST from everything else.
+#
+#   podman compose -f compose.sentinel.yaml up -d
+#
+# Read this before deploying it.
+#
+# 1. THIS HOST IS MEANT TO BE REACHED. Every other piece of the project is
+#    bound to loopback and hidden behind a tunnel. This one is the opposite:
+#    it exists to be scanned, so it advertises itself to the internet. Put
+#    nothing else on the machine. No shared credentials, no shared SSH keys,
+#    no mounted storage, nothing on the same VLAN you care about. Assume it
+#    will eventually be owned and plan for it to be rebuilt from scratch.
+#
+# 2. PORT 22 IS TAKEN BY THE SENTINEL. Your real sshd cannot also have it.
+#    Move administrative access before you start this, or you will lock
+#    yourself out:
+#
+#      # /etc/ssh/sshd_config
+#      Port 61022
+#      ListenAddress <management interface only>
+#
+#    and firewall 61022 to the addresses you administer from. Verify you can
+#    log in on the new port in a second session before closing the first.
+#
+# 3. ROOTLESS PODMAN CANNOT PUBLISH LOW PORTS by default. Either
+#
+#      sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0
+#      echo 'net.ipv4.ip_unprivileged_port_start=0' \
+#        | sudo tee /etc/sysctl.d/99-sentinel.conf
+#
+#    or run this stack rootful. The sysctl is the smaller change: it lets an
+#    unprivileged process bind a low port, which is far less than root.
+#
+# 4. GETTING THE LOGS HOME. The collector is on the other host and its
+#    OpenSearch is bound to loopback there, which is correct and which means
+#    this Vector cannot reach it over the open internet. Put a WireGuard or
+#    Tailscale link between the two machines and point the endpoint at the
+#    address on that link. Do not publish 9200 to solve this.
+#
+# 5. TELLS THIS FILE CANNOT FIX. Set a dull PTR record for the address.
+#    Prefer an allocation that is not already tagged as a scanning range.
+#    Supply a real certificate if you want the https port; a self-signed one
+#    minted yesterday is worse than a closed port. See the long comment at
+#    the top of sentinel.py.
+#
+# 6. CREATE sentinel-secrets.json BEFORE STARTING. Vector reads the endpoint
+#    and the password from it, because 0.57 disabled `${VAR}` interpolation
+#    in config files. Copy the admin password out of the collector's .env
+#    over a channel you trust, then on this host:
+#
+#      umask 077
+#      cat > sentinel-secrets.json <<'JSON'
+#      {
+#        "opensearch_endpoint": "https://10.8.0.2:9200",
+#        "opensearch_password": "<the collector's admin password>"
+#      }
+#      JSON
+#      chmod 600 sentinel-secrets.json
+#
+#    Use the address on your private link, not a public one. The file is in
+#    .containerignore and must never be committed. Bear in mind this host is
+#    the one you have assumed will eventually be owned, so the password on it
+#    should be rotated if that happens, and a dedicated OpenSearch user with
+#    write-only access to tripwire-sentinel-* is better than admin here.
+
+services:
+  sentinel:
+    build:
+      context: .
+      dockerfile: Containerfile.sentinel
+    image: localhost/sentinel:latest
+    container_name: sentinel
+    # Ports must match the chosen persona exactly. ubuntu-web is 22, 25, 80
+    # and 443; 443 only opens when a certificate is supplied. Publishing a
+    # port the persona does not serve gives a scanner a connection refused
+    # from a port that is nonetheless open, which is a contradiction nothing
+    # real produces.
+    ports:
+      - "22:22"
+      - "25:25"
+      - "80:80"
+    command:
+      - --host
+      - 0.0.0.0
+      - --persona
+      - ubuntu-web
+      - --log
+      - /var/log/sentinel/connections.jsonl
+      - --quiet
+    volumes:
+      - sentinel-logs:/var/log/sentinel:Z
+    read_only: true
+    cap_drop:
+      - ALL
+    # Needed only if you publish low ports without the sysctl above. Drop it
+    # if you set net.ipv4.ip_unprivileged_port_start=0.
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    # Async, so connections are not threads. This is a backstop against a
+    # runaway, not a capacity limit; MAX_CONCURRENT in sentinel.py is that.
+    pids_limit: 64
+    restart: unless-stopped
+    networks:
+      - sentinel
+
+  vector:
+    image: docker.io/timberio/vector:0.58.0-alpine
+    container_name: sentinel-vector
+    # Nothing in the environment. Vector 0.57 disabled `${VAR}` interpolation
+    # in config files, so both values come from the secrets file instead. See
+    # point 6 in the header for what to put in it.
+    volumes:
+      - ./vector-sentinel.toml:/etc/vector/vector.toml:ro,Z
+      - ./sentinel-secrets.json:/etc/vector/secrets.json:ro,Z
+      - sentinel-logs:/var/log/sentinel:ro,Z
+      - vector-data:/var/lib/vector:Z
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    restart: unless-stopped
+    networks:
+      - sentinel
+
+networks:
+  sentinel:
+    driver: bridge
+
+volumes:
+  sentinel-logs:
+  vector-data:

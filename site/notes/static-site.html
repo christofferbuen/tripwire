@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Keeping a static site boring &mdash; Notes</title>
+<link rel="stylesheet" href="/static/css/site.css">
+<link rel="icon" href="/static/img/logo.svg" type="image/svg+xml">
+</head>
+<body>
+
+<header class="masthead">
+  <h1><a href="/">Notes</a></h1>
+  <p class="sub">Occasional writing. Mostly unfinished.</p>
+  <nav>
+    <a href="/">Writing</a>
+    <a href="/about">About</a>
+    <a href="/contact">Contact</a>
+  </nav>
+</header>
+
+<main class="post">
+  <h1>Keeping a static site boring</h1>
+  <time datetime="2026-03-11">11 March 2026</time>
+
+  <p>Every few years I rebuild this, and every time the answer is fewer
+  moving parts. Plain files, one stylesheet, no build step to rot.</p>
+
+  <p>The last version had a generator, a theme, a plugin for footnotes and a
+  lockfile with four hundred entries in it. It worked beautifully for about
+  eight months. Then the generator went to a new major version, the theme
+  did not follow, and publishing a paragraph became an afternoon.</p>
+
+  <blockquote>The cost of a tool is not what it takes to set up. It is what
+  it takes to still be running in three years.</blockquote>
+
+  <p>So: files. I write the HTML. The nav is copied into each page by hand,
+  which sounds worse than it is, because there are five pages and they
+  change once a year.</p>
+
+</main>
+
+<footer>
+  <a href="/">Back to writing</a>
+</footer>
+
+<script src="/static/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,71 @@
+# Quadlet unit for the tripwire receiver.
+#
+# This is the production shape: systemd owns the lifecycle, podman runs it
+# rootless under a normal user account. Install as a user unit:
+#
+#   mkdir -p ~/.config/containers/systemd
+#   cp tripwire.container ~/.config/containers/systemd/
+#   systemctl --user daemon-reload
+#   systemctl --user start tripwire
+#
+# Then, so it survives logout and starts at boot:
+#   loginctl enable-linger "$USER"
+#
+# Build the image first, on the same host:
+#   podman build --tag localhost/tripwire:latest .
+
+[Unit]
+Description=Tripwire canary receiver
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/tripwire:latest
+ContainerName=tripwire
+
+# Loopback only. A TLS proxy on this host is what faces the internet.
+# Binding this to 0.0.0.0 exposes an unauthenticated logger to the world.
+PublishPort=127.0.0.1:8787:8787
+
+Volume=tripwire-data:/data:Z
+
+# The same events as SQLite, appended as JSON lines. Vector reads this file
+# rather than the database, so the shipper can never lock the writer. Harmless
+# to leave on if you are not shipping anywhere; receiver.py rotates it.
+Volume=tripwire-logs:/var/log/tripwire:Z
+Environment=TRIPWIRE_JSONL=/var/log/tripwire/hits.jsonl
+
+ReadOnly=true
+Tmpfs=/tmp:rw,noexec,nosuid,size=16m
+DropCapability=ALL
+NoNewPrivileges=true
+
+# 256 rather than 128 because the tarpit holds connections open on purpose and
+# each held connection is a thread. TARPIT_MAX_HOLDING in receiver.py caps that
+# at 64; this is the backstop if that ever fails.
+PodmanArgs=--memory 256m --pids-limit 256
+
+# Declared here rather than relying on the image. Podman builds in OCI format
+# by default, which discards the Containerfile HEALTHCHECK. Build with
+# `podman build --format docker` if you would rather it came from the image.
+HealthCmd=python3 -c "import urllib.request as u, sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8787/healthz', timeout=3).status == 200 else 1)"
+HealthInterval=30s
+HealthTimeout=5s
+HealthStartPeriod=5s
+HealthRetries=3
+
+# Exec replaces the image's default arguments outright, so any override has to
+# restate all of them.
+#
+# Uncomment only when the reverse proxy is the sole route to this port.
+# Exec=--host 0.0.0.0 --port 8787 --db /data/tripwire.sqlite3 --trust-proxy
+#
+# To run without the labyrinth:
+# Exec=--host 0.0.0.0 --port 8787 --db /data/tripwire.sqlite3 --no-tarpit
+
+[Service]
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

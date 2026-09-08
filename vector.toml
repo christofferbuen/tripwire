@@ -1,0 +1,177 @@
+# Vector 0.58.0. Tails the receiver's JSON lines and ships them to OpenSearch.
+#
+# Two deliberate choices worth knowing about.
+#
+# First, the shipper reads a file, not the SQLite database. SQLite in WAL mode
+# tolerates a concurrent reader, but a shipper that opens the database can
+# still stall a write under load, and the receiver's whole job is to never
+# drop a hit. A file tail cannot interfere with the writer at all.
+#
+# This ships the receiver's hits only. The port-scan sentinel runs on a
+# different host and has its own shipper, vector-sentinel.toml, which
+# writes into the same indices across a private link.
+#
+# Second, request headers are shipped as an encoded string rather than as an
+# object. Header names are attacker-controlled. Letting OpenSearch map each
+# one dynamically means anyone who can reach the honeypot can create
+# unlimited fields in the index mapping, which is a cheap way to break the
+# cluster. The handful of headers actually worth querying are lifted into
+# fixed fields; the rest travel as opaque text.
+
+data_dir = "/var/lib/vector"
+
+[api]
+enabled = false
+
+# --------------------------------------------------------------------------
+# Secrets
+# --------------------------------------------------------------------------
+#
+# Vector 0.57 turned off `${VAR}` interpolation in configuration files by
+# default, and 0.58 keeps it off. A config that still uses that syntax does
+# not fail: Vector sends the literal string `${OPENSEARCH_PASSWORD}` as the
+# password and every write comes back 401. The flag that restores the old
+# behaviour is named --dangerously-allow-env-var-interpolation for a reason,
+# because an environment variable that reaches a field like a file source's
+# `include` turns into an arbitrary file read.
+#
+# The secrets backend is the supported replacement. This one reads a flat
+# JSON object of string to string; ./setup-logging.sh writes it with mode
+# 600 and never prints the contents.
+
+[secret.local]
+type = "file"
+path = "/etc/vector/secrets.json"
+
+# --------------------------------------------------------------------------
+# Sources
+# --------------------------------------------------------------------------
+
+[sources.tripwire]
+type = "file"
+include = ["/var/log/tripwire/hits.jsonl"]
+read_from = "beginning"
+# Follow the inode rather than the name, so a rotation finishes the old file
+# before moving on and nothing is lost in the gap.
+fingerprint.strategy = "checksum"
+fingerprint.lines = 1
+max_line_bytes = 262144
+
+# --------------------------------------------------------------------------
+# Transforms
+# --------------------------------------------------------------------------
+
+[transforms.hits]
+type = "remap"
+inputs = ["tripwire"]
+drop_on_error = true
+reroute_dropped = true
+source = '''
+parsed = object!(parse_json!(.message))
+del(.message)
+. = merge(., parsed)
+
+."@timestamp" = .ts
+del(.ts)
+
+# Vector's own metadata. The ingest time is worth keeping, because the gap
+# between it and @timestamp is how you notice the shipper falling behind.
+# The container id in .host is not.
+.event = {
+  "kind": "event",
+  "dataset": "tripwire.hits",
+  "module": "receiver",
+  "ingested": .timestamp
+}
+.log = { "file": { "path": .file } }
+del(.timestamp)
+del(.file)
+del(.host)
+del(.source_type)
+
+# What each tier actually proved. Kept in step with the docstring in
+# receiver.py; if you add a tier there, add it here.
+tiers = {
+  "0": "render-or-cover",
+  "1": "url-extractor",
+  "2": "instruction-follower",
+  "3": "collection-post",
+  "4": "probe",
+  "5": "tarpit"
+}
+tier_key = to_string(.tier) ?? "?"
+.tier_name = get(tiers, [tier_key]) ?? "unknown"
+
+# Header names are attacker-controlled. Lift the few worth querying into
+# fixed fields and encode the rest, so nothing can grow the index mapping.
+headers = object(.headers) ?? {}
+lower = {}
+for_each(headers) -> |k, v| {
+  lower = set!(lower, [downcase(k)], v)
+}
+.http = {
+  "user_agent": .user_agent,
+  "referer":         get(lower, ["referer"]) ?? null,
+  "accept":          get(lower, ["accept"]) ?? null,
+  "accept_language": get(lower, ["accept-language"]) ?? null,
+  "accept_encoding": get(lower, ["accept-encoding"]) ?? null,
+  "sec_fetch_mode":  get(lower, ["sec-fetch-mode"]) ?? null,
+  "sec_fetch_dest":  get(lower, ["sec-fetch-dest"]) ?? null,
+  "cf_connecting_ip": get(lower, ["cf-connecting-ip"]) ?? null,
+  "x_forwarded_for":  get(lower, ["x-forwarded-for"]) ?? null,
+  "header_count": length(headers),
+  "headers_raw": encode_json(headers)
+}
+del(.headers)
+del(.user_agent)
+
+# A hit that carried no render beacon and no fetch metadata read the page as
+# text. Precomputing it here means the dashboard does not have to.
+.no_fetch_metadata = .http.sec_fetch_mode == null
+
+.source = { "ip": .ip }
+del(.ip)
+'''
+
+# --------------------------------------------------------------------------
+# Sinks
+# --------------------------------------------------------------------------
+#
+# acknowledgements.enabled means the file sources do not advance their read
+# checkpoint until OpenSearch has confirmed the write. Combined with the disk
+# buffer and when_full = "block", a cluster restart costs latency rather than
+# events: Vector fills its buffer, then stops reading, and the lines stay in
+# the file until it can catch up.
+
+[sinks.opensearch_hits]
+type = "elasticsearch"
+inputs = ["hits"]
+endpoints = ["https://opensearch:9200"]
+api_version = "v7"
+mode = "bulk"
+bulk.index = "tripwire-hits-%Y.%m.%d"
+auth.strategy = "basic"
+auth.user = "admin"
+auth.password = "SECRET[local.opensearch_password]"
+# The cluster ships with self-signed demo certificates and is only reachable
+# on the internal container network. Verification is off because there is no
+# certificate authority to verify against, not because the traffic is
+# uninteresting. Issue real certificates if this ever crosses a host boundary.
+tls.verify_certificate = false
+tls.verify_hostname = false
+acknowledgements.enabled = true
+batch.timeout_secs = 5
+
+[sinks.opensearch_hits.buffer]
+type = "disk"
+max_size = 268435488
+when_full = "block"
+
+# Anything that failed to parse. This is where a malformed line ends up, and
+# seeing it in `podman logs tripwire-vector` is the fastest way to notice the
+# receiver and the parse rules have drifted apart.
+[sinks.parse_failures]
+type = "console"
+inputs = ["hits.dropped"]
+target = "stderr"
+encoding.codec = "json"
