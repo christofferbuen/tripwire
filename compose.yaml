@@ -181,29 +181,6 @@ services:
     networks:
       - tripwire
 
-  cloudflared:
-    # Outbound-only tunnel to Cloudflare. Reaches Dashboards over the
-    # container network, so nothing extra is bound on the host. Put a
-    # Cloudflare Access policy in front of the hostname; the Dashboards
-    # login is the second gate, not the only one. The tunnel's ingress
-    # rules live in Cloudflare (remotely managed), keyed by the token.
-    image: docker.io/cloudflare/cloudflared:2026.8.0
-    container_name: tripwire-cloudflared
-    command: tunnel --no-autoupdate run
-    environment:
-      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set this in .env}
-    depends_on:
-      - dashboards
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    mem_limit: 128m
-    restart: unless-stopped
-    networks:
-      - tripwire
-
 networks:
   tripwire:
     driver: bridge
