@@ -195,11 +195,17 @@ Order matters on the collector host.
 sudo sysctl -w vm.max_map_count=262144   # OpenSearch will not start without it
 ./setup-logging.sh                       # writes .env and vector-secrets.json, mode 600
 podman compose up -d
-./bootstrap-opensearch.sh                # index template and retention, after healthy
+./bootstrap-opensearch.sh                # index template, retention, dashboards; after healthy
 ```
 
 `setup-logging.sh` generates the admin password and never prints it. Read it
 out of `.env` when the dashboard asks.
+
+`bootstrap-opensearch.sh` also creates the `tripwire` index pattern and
+imports the "Tripwire overview" dashboard, which `dashboards.py` generates.
+Both go into the Global tenant, so every login sees them. Edit
+`dashboards.py` and re-run the bootstrap to change the panels; the fixed ids
+mean re-importing updates in place.
 
 The receiver alone, without the logging stack:
 

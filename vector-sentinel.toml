@@ -62,6 +62,11 @@ del(.host)
 del(.source_type)
 .source = { "ip": .ip }
 del(.ip)
+# Same field names as the receiver's hits, so one dashboard panel covers
+# both. Absent on connections that never spoke HTTP.
+.http = { "user_agent": .http_user_agent, "host": .http_host }
+del(.http_user_agent)
+del(.http_host)
 
 # A connection that completed the handshake and then said nothing is a
 # scanner confirming the port is open. One that spoke the protocol is trying

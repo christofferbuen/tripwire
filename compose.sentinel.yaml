@@ -70,15 +70,14 @@ services:
       dockerfile: Containerfile.sentinel
     image: localhost/sentinel:latest
     container_name: sentinel
-    # Ports must match the chosen persona exactly. ubuntu-web is 22, 25, 80
-    # and 443; 443 only opens when a certificate is supplied. Publishing a
-    # port the persona does not serve gives a scanner a connection refused
-    # from a port that is nonetheless open, which is a contradiction nothing
-    # real produces.
-    ports:
-      - "22:22"
-      - "25:25"
-      - "80:80"
+    # Host networking, not published ports: rootless podman forwards a
+    # published port through a userspace proxy (rootlessport), so every peer
+    # is logged as the bridge address and the sentinel loses the one thing it
+    # exists to record. Listening in the host namespace keeps the real
+    # address. Needs net.ipv4.ip_unprivileged_port_start=0 (point 3 above).
+    # The persona decides which ports open (ubuntu-web: 22, 25, 80, and 443
+    # only when a certificate is supplied), so nothing else may listen there.
+    network_mode: host
     command:
       - --host
       - 0.0.0.0
@@ -103,8 +102,6 @@ services:
     # runaway, not a capacity limit; MAX_CONCURRENT in sentinel.py is that.
     pids_limit: 64
     restart: unless-stopped
-    networks:
-      - sentinel
 
   vector:
     image: docker.io/timberio/vector:0.58.0-alpine

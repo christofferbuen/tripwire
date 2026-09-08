@@ -274,10 +274,27 @@ dash() {
   curl -sS -X "$1" "${DASH_URL}$2" -u "admin:${OS_PASS}" \
     -H 'osd-xsrf: true' -H 'Content-Type: application/json' -H 'securitytenant: global' -d "$3"
 }
-dash POST '/api/saved_objects/index-pattern/tripwire?overwrite=true' \
-  '{"attributes":{"title":"tripwire-*","timeFieldName":"@timestamp"}}' > /dev/null \
+# With its field list filled in. A pattern saved without one has an empty
+# field cache, and every visualisation fails with "Could not locate that
+# index-pattern-field (id: @timestamp)" until somebody presses refresh.
+pattern_doc() {
+  curl -sS "${DASH_URL}/api/index_patterns/_fields_for_wildcard?pattern=tripwire-*&meta_fields=_source&meta_fields=_id&meta_fields=_index&meta_fields=_score" \
+    -u "admin:${OS_PASS}" -H 'securitytenant: global' \
+    | python3 -c 'import sys, json
+fields = json.dumps(json.load(sys.stdin)["fields"])
+print(json.dumps({"attributes": {"title": "tripwire-*", "timeFieldName": "@timestamp", "fields": fields}}))'
+}
+dash POST '/api/saved_objects/index-pattern/tripwire?overwrite=true' "$(pattern_doc)" > /dev/null \
   && dash POST /api/opensearch-dashboards/settings '{"changes":{"defaultIndex":"tripwire"}}' > /dev/null \
   && echo "  done" || echo "  skipped (Dashboards not reachable at ${DASH_URL})"
+
+echo "Importing the overview dashboard."
+python3 "$(dirname "$0")/dashboards.py" > /tmp/tripwire-dashboards.ndjson
+curl -sS -X POST "${DASH_URL}/api/saved_objects/_import?overwrite=true" \
+  -u "admin:${OS_PASS}" -H 'osd-xsrf: true' -H 'securitytenant: global' \
+  -F file=@/tmp/tripwire-dashboards.ndjson \
+  | python3 -c 'import sys, json; d = json.load(sys.stdin); print("  imported", d.get("successCount"), "objects", "" if d.get("success") else d)'
+rm -f /tmp/tripwire-dashboards.ndjson
 
 echo
 echo "Verifying."

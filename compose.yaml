@@ -35,6 +35,10 @@ services:
     container_name: tripwire
     ports:
       - "127.0.0.1:8787:8787"
+    # The only route in is the Cloudflare tunnel on this host, so the
+    # CF-Connecting-IP it sets is the real client. Never set this if the
+    # port is ever reachable another way.
+    command: ["--host", "0.0.0.0", "--port", "8787", "--db", "/data/tripwire.sqlite3", "--trust-proxy"]
     environment:
       # Picked up by the receiver's --jsonl default. Writing the same events
       # to a file as well as SQLite means the shipper never touches the
