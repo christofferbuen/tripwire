@@ -101,7 +101,7 @@ days after a fresh `fingerprint-book`; that is expected, not a bug.
   (a `mail.` or `www.` under a domain that is not the operator's), and make
   the forward A record agree, so a scanner's lookup does not stand out.
 - **Certificate for 443 on the sentinel.** Wakes JA4: `do_https` already
-  does a real handshake once `TLS_CERT`/`TLS_KEY` exist. Needs a hostname
+  does a real handshake once `--tls-cert`/`--tls-key` are passed (and 443 added to the persona ports). Needs a hostname
   pointing at the VM (see PTR), then a Let's Encrypt cert obtained on the VM
   and bind-mounted into the container. Self-signed is fine for the
   fingerprint itself, but a real cert makes the persona hold up.
