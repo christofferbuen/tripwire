@@ -98,7 +98,7 @@ api_version = "v7"
 mode = "bulk"
 bulk.index = "tripwire-sentinel-%Y.%m.%d"
 auth.strategy = "basic"
-auth.user = "admin"
+auth.user = "sentinel-writer"
 auth.password = "SECRET[local.opensearch_password]"
 # The cluster uses self-signed demo certificates and is reached over a
 # private encrypted link, which is what is actually protecting this traffic.

@@ -109,6 +109,13 @@ services:
   vector:
     image: docker.io/timberio/vector:0.58.0-alpine
     container_name: sentinel-vector
+    # The image defaults to /etc/vector/vector.yaml; the config here is TOML.
+    command: ["--config", "/etc/vector/vector.toml"]
+    # Start after the sentinel so the log volume is created owned by the
+    # sentinel's uid. Whichever container mounts a fresh volume first owns it,
+    # and this one mounts it read-only.
+    depends_on:
+      - sentinel
     # Nothing in the environment. Vector 0.57 disabled `${VAR}` interpolation
     # in config files, so both values come from the secrets file instead. See
     # point 6 in the header for what to put in it.
