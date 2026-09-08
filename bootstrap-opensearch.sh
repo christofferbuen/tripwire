@@ -23,7 +23,6 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 RETENTION_DAYS="${RETENTION_DAYS:-90}"
-OS_URL="${OS_URL:-https://127.0.0.1:9200}"
 
 if [[ ! -f .env ]]; then
   echo "No .env. Run ./setup-logging.sh first." >&2
@@ -33,6 +32,8 @@ fi
 set -a; source .env; set +a
 : "${OPENSEARCH_INITIAL_ADMIN_PASSWORD:?not set in .env}"
 export OS_PASS="$OPENSEARCH_INITIAL_ADMIN_PASSWORD"
+# Follows the bind address compose.yaml publishes 9200 on.
+OS_URL="${OS_URL:-https://${ADMIN_BIND:-127.0.0.1}:9200}"
 
 # -k because the cluster uses the self-signed demo certificates and is
 # reachable on loopback only. --netrc-file /dev/null keeps curl from picking

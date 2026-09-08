@@ -1,0 +1,2 @@
+# Everything here runs on Linux hosts. Keep LF regardless of the checkout OS.
+* text=auto eol=lf

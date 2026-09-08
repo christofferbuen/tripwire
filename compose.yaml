@@ -80,6 +80,9 @@ services:
     # direct mitigation. About 61 MB against 97 MB.
     image: docker.io/timberio/vector:0.58.0-alpine
     container_name: tripwire-vector
+    # The image's default config path is /etc/vector/vector.yaml. Without
+    # this it never opens the TOML mounted below and restarts forever.
+    command: ["--config", "/etc/vector/vector.toml"]
     depends_on:
       opensearch:
         condition: service_healthy
@@ -136,9 +139,10 @@ services:
     volumes:
       - opensearch-data:/usr/share/opensearch/data:Z
     ports:
-      # Loopback only, for ad-hoc queries from the host. Nothing outside the
-      # box needs to reach this.
-      - "127.0.0.1:9200:9200"
+      # Loopback by default. Set ADMIN_BIND in .env to the host's WireGuard
+      # address so the sentinel's Vector can ship across the private link.
+      # Never a public interface.
+      - "${ADMIN_BIND:-127.0.0.1}:9200:9200"
     mem_limit: 2g
     restart: unless-stopped
     networks:
@@ -169,8 +173,9 @@ services:
       # No anonymous read. Reaching the dashboard still costs a login.
       OPENSEARCH_SECURITY_ENABLE_MULTITENANCY: "false"
     ports:
-      # Loopback only. Reach it with `ssh -L 5601:127.0.0.1:5601 host`.
-      - "127.0.0.1:5601:5601"
+      # Same bind as OpenSearch. Reach it with
+      # `ssh -L 5601:${ADMIN_BIND}:5601 host`.
+      - "${ADMIN_BIND:-127.0.0.1}:5601:5601"
     mem_limit: 1g
     restart: unless-stopped
     networks:
