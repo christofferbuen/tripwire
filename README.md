@@ -247,13 +247,23 @@ mean re-importing updates in place.
 **Alerts** go to a self-hosted [ntfy](https://ntfy.sh) server when `NTFY_URL`
 and `NTFY_TOKEN` are in `.env` (the token is a write-only ntfy access token
 for the topic; `NTFY_TOPIC` defaults to `tripwire`). The bootstrap then runs
-`alerts.py`, which creates one webhook channel and three monitors in the
+`alerts.py`, which creates two webhook channels and six monitors in the
 Alerting plugin, all idempotent: a canary token presented back to the
 receiver, something following an embedded instruction or posting to the
-collection endpoint (tiers 2 and 3), and one address touching both the
-sentinel and the receiver within an hour. Messages are plain text, so the
-attacker strings they quote can do nothing on the phone. Without the token
-the monitors are skipped and nothing else changes.
+collection endpoint (tiers 2 and 3), one address touching both the
+sentinel and the receiver within an hour, two dead-man switches (no sentinel
+events for an hour, no receiver heartbeat for 30 minutes), and a low-priority
+digest at 07:00 (`DIGEST_TZ`, default Europe/Oslo). Messages are plain text,
+so the attacker strings they quote can do nothing on the phone. Without the
+token the monitors are skipped and nothing else changes.
+
+The receiver heartbeat is a cron job on the collector host that fetches the
+public site every ten minutes, so the whole path (tunnel, receiver, Vector,
+OpenSearch) is exercised and the digest can exclude it by user agent:
+
+```
+*/10 * * * * curl -sS -A tripwire-heartbeat -o /dev/null --max-time 20 https://<public host>/ >/dev/null 2>&1
+```
 
 The receiver alone, without the logging stack:
 

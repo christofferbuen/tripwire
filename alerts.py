@@ -4,22 +4,34 @@
 bootstrap-opensearch.sh runs this when NTFY_TOKEN is set in .env. Everything
 is keyed by a fixed name or id, so re-running updates in place.
 
-One channel: a webhook to the ntfy server, token in an Authorization header,
-title and priority as ntfy headers so the message template stays plain text.
-Three monitors:
+Two channels, both webhooks to the ntfy server with the token in an
+Authorization header and title, priority and tags as ntfy headers so the
+message templates stay plain text: one high priority for things that need a
+look, one low priority for the daily digest.
 
-  tripwire-canary   a canary token was presented back to the receiver
-  tripwire-agent    something followed an embedded instruction or posted
-                    to the collection endpoint (tiers 2 and 3)
-  tripwire-both     one address touched the sentinel and the receiver within
-                    an hour: scanned first, then knocked
+  tripwire-canary            a canary token was presented back to the receiver
+  tripwire-agent             something followed an embedded instruction or
+                             posted to the collection endpoint (tiers 2 and 3)
+  tripwire-both              one address touched the sentinel and the receiver
+                             within an hour: scanned first, then knocked
+  tripwire-sentinel-silent   no sentinel events for an hour. It sees dozens
+                             of connections an hour at its quietest, so an
+                             empty hour means the VM, its Vector or WireGuard
+                             is down, not that the internet went quiet
+  tripwire-receiver-silent   no heartbeat hit for 30 minutes. The receiver
+                             can legitimately go hours without a visitor, so
+                             a cron job on the collector fetches the public
+                             site every 10 minutes with User-Agent
+                             tripwire-heartbeat (see README). Missing three
+                             in a row means receiver, Vector or tunnel is down
+  tripwire-digest            07:00 summary of the last 24 hours, low priority
 
 Everything a message contains is attacker text (paths, user agents). ntfy
 shows it as text and nothing more, which is the point of a push channel over
 an HTML mail.
 
 Environment: OS_URL, OS_PASS, NTFY_URL (base URL of the ntfy server),
-NTFY_TOKEN, NTFY_TOPIC (default tripwire).
+NTFY_TOKEN, NTFY_TOPIC (default tripwire), DIGEST_TZ (default Europe/Oslo).
 """
 
 import base64
@@ -35,8 +47,11 @@ OS_PASS = os.environ["OS_PASS"]
 NTFY_URL = os.environ["NTFY_URL"].rstrip("/")
 NTFY_TOKEN = os.environ["NTFY_TOKEN"]
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "tripwire")
+DIGEST_TZ = os.environ.get("DIGEST_TZ", "Europe/Oslo")
 
 CHANNEL_ID = "tripwire-ntfy"
+DIGEST_CHANNEL_ID = "tripwire-ntfy-digest"
+HEARTBEAT_AGENT = "tripwire-heartbeat"
 
 # Self-signed demo certificates on a loopback or WireGuard address.
 INSECURE = ssl.create_default_context()
@@ -64,8 +79,8 @@ def window(minutes):
                                      "format": "epoch_millis"}}}
 
 
-def action(message, throttle_minutes=None, per_alert=False):
-    act = {"name": "ntfy", "destination_id": CHANNEL_ID,
+def action(message, throttle_minutes=None, per_alert=False, channel_id=CHANNEL_ID):
+    act = {"name": "ntfy", "destination_id": channel_id,
            "subject_template": {"source": "Tripwire", "lang": "mustache"},
            "message_template": {"source": message, "lang": "mustache"},
            "throttle_enabled": throttle_minutes is not None}
@@ -80,22 +95,72 @@ def action(message, throttle_minutes=None, per_alert=False):
 
 
 def query_monitor(name, indices, filters, trigger_name, severity, message,
-                  minutes=5, size=5):
+                  minutes=5, size=5, condition="ctx.results[0].hits.total.value > 0",
+                  throttle_minutes=None, aggs=None, schedule=None,
+                  channel_id=CHANNEL_ID):
+    search = {"size": size, "sort": [{"@timestamp": "desc"}],
+              "query": {"bool": {"filter": filters + [window(minutes)]}}}
+    if aggs:
+        search["aggs"] = aggs
+    if throttle_minutes is None:
+        # The window is five minutes and the monitor runs every minute,
+        # so one event would fire five times without the throttle.
+        throttle_minutes = minutes
     return {
         "type": "monitor", "name": name, "monitor_type": "query_level_monitor",
         "enabled": True,
-        "schedule": {"period": {"interval": 1, "unit": "MINUTES"}},
-        "inputs": [{"search": {"indices": indices, "query": {
-            "size": size, "sort": [{"@timestamp": "desc"}],
-            "query": {"bool": {"filter": filters + [window(minutes)]}}}}}],
+        "schedule": schedule or {"period": {"interval": 1, "unit": "MINUTES"}},
+        "inputs": [{"search": {"indices": indices, "query": search}}],
         "triggers": [{"query_level_trigger": {
             "name": trigger_name, "severity": severity,
-            "condition": {"script": {"source": "ctx.results[0].hits.total.value > 0",
-                                     "lang": "painless"}},
-            # The window is five minutes and the monitor runs every minute,
-            # so one event would fire five times without the throttle.
-            "actions": [action(message, throttle_minutes=minutes)]}}],
+            "condition": {"script": {"source": condition, "lang": "painless"}},
+            "actions": [action(message, throttle_minutes=throttle_minutes or None,
+                               channel_id=channel_id)]}}],
     }
+
+
+def silent_monitor(name, indices, filters, minutes, message):
+    """Dead-man switch: fires on an empty window, repeats every six hours."""
+    return query_monitor(name, indices, filters, "silent", "2", message,
+                         minutes=minutes, size=0,
+                         condition="ctx.results[0].hits.total.value == 0",
+                         throttle_minutes=360)
+
+
+def top(field, size=3):
+    return {"terms": {"field": field, "size": size}}
+
+
+DIGEST_AGGS = {"by": {
+    "filters": {"filters": {
+        "receiver": {"bool": {
+            "filter": [{"term": {"event.module": "receiver"}}],
+            "must_not": [{"term": {"http.user_agent": HEARTBEAT_AGENT}}]}},
+        "sentinel": {"term": {"event.module": "sentinel"}}}},
+    "aggs": {"ips": {"cardinality": {"field": "source.ip"}},
+             "cc": top("source.geo.country_iso_code"),
+             "tiers": top("tier_name", 6),
+             "ports": top("port"),
+             "held": {"sum": {"field": "held_ms"}},
+             # Sums come back as doubles; format gives a whole number of
+             # minutes as value_as_string for the template.
+             "held_min": {"bucket_script": {"buckets_path": {"h": "held"},
+                                            "script": "Math.round(params.h/60000)",
+                                            "format": "0"}}}}}
+
+DIGEST_MESSAGE = (
+    "Last 24 h\n"
+    "{{#ctx.results.0.aggregations.by.buckets.receiver}}"
+    "Receiver: {{doc_count}} hits from {{ips.value}} addresses\n"
+    " tiers: {{#tiers.buckets}}{{key}}={{doc_count}} {{/tiers.buckets}}\n"
+    " countries: {{#cc.buckets}}{{key}}={{doc_count}} {{/cc.buckets}}\n"
+    "{{/ctx.results.0.aggregations.by.buckets.receiver}}"
+    "{{#ctx.results.0.aggregations.by.buckets.sentinel}}"
+    "Sentinel: {{doc_count}} connections from {{ips.value}} addresses, "
+    "{{held_min.value_as_string}} min held\n"
+    " ports: {{#ports.buckets}}{{key}}={{doc_count}} {{/ports.buckets}}\n"
+    " countries: {{#cc.buckets}}{{key}}={{doc_count}} {{/cc.buckets}}"
+    "{{/ctx.results.0.aggregations.by.buckets.sentinel}}")
 
 
 HITS = ["tripwire-hits-*"]
@@ -142,28 +207,43 @@ MONITORS = [
                 "{{#ctx.newAlerts}}{{bucket_keys}} {{/ctx.newAlerts}}",
                 per_alert=True)]}}],
     },
+    silent_monitor(
+        "tripwire-sentinel-silent", SENTINEL, [], 60,
+        "Sentinel silent: no events for an hour. It normally sees dozens, "
+        "so the VM, its Vector or WireGuard is down."),
+    silent_monitor(
+        "tripwire-receiver-silent", HITS,
+        [{"term": {"http.user_agent": HEARTBEAT_AGENT}}], 30,
+        "Receiver heartbeat missing for 30 minutes: three fetches of the "
+        "public site failed to arrive. Receiver, its Vector or the tunnel "
+        "is down."),
+    query_monitor(
+        "tripwire-digest", HITS + SENTINEL, [], "daily", "5", DIGEST_MESSAGE,
+        minutes=24 * 60, size=0, condition="true", throttle_minutes=0,
+        aggs=DIGEST_AGGS, channel_id=DIGEST_CHANNEL_ID,
+        schedule={"cron": {"expression": "0 7 * * *", "timezone": DIGEST_TZ}}),
 ]
 
 
-def channel():
-    config = {"name": "ntfy", "description": f"ntfy topic {NTFY_TOPIC}",
+def channel(channel_id, title, priority, tags):
+    config = {"name": channel_id, "description": f"ntfy topic {NTFY_TOPIC}",
               "config_type": "webhook", "is_enabled": True,
               "webhook": {"url": f"{NTFY_URL}/{NTFY_TOPIC}", "method": "POST",
                           "header_params": {
                               "Authorization": f"Bearer {NTFY_TOKEN}",
-                              "Title": "Tripwire",
-                              "Priority": "high",
-                              "Tags": "honeypot"}}}
-    status, _ = call("GET", f"/_plugins/_notifications/configs/{CHANNEL_ID}")
+                              "Title": title,
+                              "Priority": priority,
+                              "Tags": tags}}}
+    status, _ = call("GET", f"/_plugins/_notifications/configs/{channel_id}")
     if status == 200:
-        status, body = call("PUT", f"/_plugins/_notifications/configs/{CHANNEL_ID}",
+        status, body = call("PUT", f"/_plugins/_notifications/configs/{channel_id}",
                             {"config": config})
     else:
         status, body = call("POST", "/_plugins/_notifications/configs",
-                            {"config_id": CHANNEL_ID, "config": config})
+                            {"config_id": channel_id, "config": config})
     if status != 200:
         sys.exit(f"channel: {status} {body}")
-    print(f"  channel {CHANNEL_ID}: {NTFY_URL}/{NTFY_TOPIC}")
+    print(f"  channel {channel_id}: {NTFY_URL}/{NTFY_TOPIC} priority {priority}")
 
 
 def existing_monitor(name):
@@ -198,7 +278,8 @@ def test_channel():
 
 
 if __name__ == "__main__":
-    channel()
+    channel(CHANNEL_ID, "Tripwire", "high", "honeypot")
+    channel(DIGEST_CHANNEL_ID, "Tripwire digest", "low", "bar_chart")
     monitors()
     if "--test" in sys.argv:
         test_channel()
