@@ -298,6 +298,12 @@ def monitors():
             status, body = call("PUT", f"/_plugins/_alerting/monitors/{mid}", monitor)
         else:
             status, body = call("POST", "/_plugins/_alerting/monitors", monitor)
+        if status == 404 and "not found" in json.dumps(body):
+            # The enricher creates fingerprint-book on its first pass; on a
+            # fresh install the bootstrap can get here first. Same as the
+            # address-book pattern: skipped now, created on the next run.
+            print(f"  monitor {monitor['name']}: index not there yet, skipped")
+            continue
         if status not in (200, 201):
             sys.exit(f"monitor {monitor['name']}: {status} {body}")
         print(f"  monitor {monitor['name']}: {'updated' if mid else 'created'}")
