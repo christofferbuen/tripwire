@@ -74,6 +74,14 @@ executed, interpreted, or stored anywhere it can run. There is no shell, no
 filesystem access and no real service. The entire program is a set of
 sockets that write to a log.
 
+What it keeps. Besides who connected and what they said, the sentinel hashes
+the shape of the client's own protocol stack: its SSH algorithm lists
+(HASSH), the order of its HTTP headers, and its TLS ClientHello (JA4). None
+of it is sent back to the client, and none of it changes what the client
+sees; it is read from bytes that were arriving anyway. An address is cheap
+identity and these are not, which is what makes the same tool recognisable
+from a new address next week.
+
 Data note. Ports 25 and 3306 collect login attempts, and those contain
 credentials belonging to whoever was sprayed before you. Treat the log as
 sensitive, keep retention short, and do not republish it.
@@ -84,14 +92,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import pathlib
 import random
+import re
 import signal
 import socket
+import ssl
 import struct
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -453,6 +465,10 @@ def mysql_error(seq: int, code: int, sqlstate: str, message: str) -> bytes:
     return struct.pack("<I", len(payload))[:3] + bytes([seq]) + payload
 
 
+def _u16(data: bytes, offset: int) -> int:
+    return struct.unpack_from(">H", data, offset)[0]
+
+
 def mysql_username(packet: bytes) -> str | None:
     """Pull the username out of a client handshake response, if it is there."""
     if len(packet) < 40:
@@ -468,17 +484,347 @@ def mysql_username(packet: bytes) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Fingerprints
+#
+# An address is cheap identity: it is rented, rotated and shared. A protocol
+# stack is expensive identity. The exact algorithm lists in a client's
+# KEXINIT, the exact order of its HTTP headers and the exact shape of its
+# ClientHello are properties of the tool, not of where it is running from,
+# and they are already arriving on the wire. These functions are pure so the
+# selftest can drive them without a socket; nothing here changes a byte that
+# goes back out.
+# ---------------------------------------------------------------------------
+
+# GREASE, RFC 8701: reserved values a client sprinkles into its lists to keep
+# middleboxes honest. They are picked at random per connection, so anything
+# that hashes them produces a different fingerprint every time.
+GREASE = frozenset(range(0x0A0A, 0x10000, 0x1010))
+
+TLS_VERSIONS = {0x0304: "13", 0x0303: "12", 0x0302: "11", 0x0301: "10",
+                0x0300: "s3"}
+
+SSH_NAMELISTS = ("kex", "hostkey", "enc_c2s", "enc_s2c", "mac_c2s", "mac_s2c",
+                 "comp_c2s", "comp_s2c", "lang_c2s", "lang_s2c")
+
+
+def parse_kexinit(data: bytes) -> dict[str, str] | None:
+    """The ten algorithm name-lists out of an SSH_MSG_KEXINIT packet.
+
+    None when the bytes are not a KEXINIT or are not all there yet. The
+    framing is RFC 4253: uint32 packet length, byte padding length, byte
+    message type, 16-byte cookie, then the lists.
+    """
+    if len(data) < 6:
+        return None
+    length = struct.unpack(">I", data[:4])[0]
+    padding = data[4]
+    if not 2 <= length <= 65536 or len(data) < 4 + length or padding >= length:
+        return None
+    if data[5] != 20:                       # SSH_MSG_KEXINIT
+        return None
+    rest = data[6:4 + length - padding]
+    if len(rest) < 16:
+        return None
+    rest = rest[16:]                        # cookie
+    names = []
+    for _ in range(len(SSH_NAMELISTS)):
+        if len(rest) < 4:
+            return None
+        size = struct.unpack(">I", rest[:4])[0]
+        if len(rest) < 4 + size:
+            return None
+        names.append(rest[4:4 + size].decode("ascii", "replace"))
+        rest = rest[4 + size:]
+    return dict(zip(SSH_NAMELISTS, names))
+
+
+def hassh(lists: dict[str, str]) -> str:
+    """HASSH: md5 of kex;cipher;mac;compression, client to server."""
+    raw = ";".join((lists["kex"], lists["enc_c2s"],
+                    lists["mac_c2s"], lists["comp_c2s"]))
+    return hashlib.md5(raw.encode(), usedforsecurity=False).hexdigest()
+
+
+def header_fingerprint(lines: list[str], version: str) -> tuple[str, str]:
+    """Header names in wire order, and a hash of that order plus the version.
+
+    Duplicates are kept: sending Accept twice is itself characteristic. The
+    values are deliberately not hashed, only the shape of the request.
+    """
+    names = [line.partition(":")[0].strip().lower() for line in lines]
+    order = ",".join(names)
+    digest = hashlib.sha256(f"{version}|{order}".encode()).hexdigest()[:12]
+    return order[:1024], digest
+
+
+def _parse_sni(body: bytes) -> str | None:
+    end = 2 + _u16(body, 0)
+    pos = 2
+    while pos + 3 <= end:
+        kind = body[pos]
+        size = _u16(body, pos + 1)
+        pos += 3
+        if kind == 0:
+            # Punycode on the wire, so ASCII; anything else is a client
+            # doing something odd and is recorded as it arrived.
+            return body[pos:pos + size].decode("ascii", "replace")[:253]
+        pos += size
+    return None
+
+
+def _parse_alpn(body: bytes) -> list[bytes]:
+    end = 2 + _u16(body, 0)
+    pos, protocols = 2, []
+    while pos < end and pos < len(body):
+        size = body[pos]
+        protocols.append(body[pos + 1:pos + 1 + size])
+        pos += 1 + size
+    return protocols
+
+
+def _uint16_list(body: bytes, offset: int, size: int) -> list[int]:
+    return [v for v in (_u16(body, offset + k) for k in range(0, size - 1, 2))
+            if v not in GREASE]
+
+
+def parse_client_hello(data: bytes) -> dict | None:
+    """A TLS ClientHello out of a stream of TLS records.
+
+    None when this is not a TLS handshake at all, or when the hello has not
+    all arrived: a handshake message may be split across records, and records
+    across segments.
+    """
+    handshake, pos = b"", 0
+    while len(data) - pos >= 5:
+        if data[pos] != 22:                 # not handshake: SSLv2, HTTP, junk
+            return None
+        size = _u16(data, pos + 3)
+        if len(data) - pos - 5 < size:
+            break
+        handshake += data[pos + 5:pos + 5 + size]
+        pos += 5 + size
+    if len(handshake) < 4 or handshake[0] != 1:     # 1 = ClientHello
+        return None
+    size = int.from_bytes(handshake[1:4], "big")
+    if len(handshake) < 4 + size:
+        return None
+    try:
+        return _client_hello_fields(handshake[4:4 + size])
+    except (struct.error, IndexError, ValueError):
+        return None
+
+
+def _client_hello_fields(body: bytes) -> dict:
+    legacy = _u16(body, 0)
+    pos = 34                                        # version, 32-byte random
+    pos += 1 + body[pos]                            # legacy session id
+    size = _u16(body, pos)
+    ciphers = _uint16_list(body, pos + 2, size)
+    pos += 2 + size
+    pos += 1 + body[pos]                            # compression methods
+
+    extensions: list[int] = []
+    sni: str | None = None
+    sni_present = False
+    alpn: list[bytes] = []
+    versions: list[int] = []
+    sigalgs: list[int] = []
+    if pos + 2 <= len(body):
+        end = min(pos + 2 + _u16(body, pos), len(body))
+        pos += 2
+        while pos + 4 <= end:
+            kind = _u16(body, pos)
+            size = _u16(body, pos + 2)
+            pos += 4
+            if pos + size > end:
+                raise ValueError("extension runs past the hello")
+            ext = body[pos:pos + size]
+            pos += size
+            if kind in GREASE:
+                continue
+            extensions.append(kind)
+            if kind == 0x0000:
+                # An empty server_name still counts as present: the JA4 flag
+                # is about whether the client asked by name at all.
+                sni_present = True
+                if ext:
+                    sni = _parse_sni(ext)
+            elif kind == 0x0010 and ext:
+                alpn = _parse_alpn(ext)
+            elif kind == 0x002B and ext:
+                versions = _uint16_list(ext, 1, ext[0])
+            elif kind == 0x000D and ext:
+                sigalgs = _uint16_list(ext, 2, _u16(ext, 0))
+
+    # supported_versions wins when it holds anything real; a hello carrying
+    # only GREASE there falls back to the legacy field, as does TLS 1.2.
+    chosen = max(versions) if versions else legacy
+    return {
+        "version": TLS_VERSIONS.get(chosen, "00"),
+        "sni": sni,
+        "sni_present": sni_present,
+        "alpn": alpn,
+        "ciphers": ciphers,
+        "extensions": extensions,
+        "sigalgs": sigalgs,
+    }
+
+
+def _alpn_code(protocols: list[bytes]) -> str:
+    """The two-character ALPN part of a JA4: first and last character."""
+    if not protocols or not protocols[0]:
+        return "00"
+    raw = protocols[0]
+    if 0x21 <= raw[0] <= 0x7E and 0x21 <= raw[-1] <= 0x7E:
+        return chr(raw[0]) + chr(raw[-1])
+    return f"{raw[0]:02x}"[0] + f"{raw[-1]:02x}"[1]
+
+
+def _truncate_hash(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:12]
+
+
+def ja4(hello: dict) -> str:
+    """JA4 for a TCP ClientHello: t<version><sni><ciphers><exts><alpn>_b_c."""
+    ciphers, extensions = hello["ciphers"], hello["extensions"]
+    a = ("t" + hello["version"]
+         + ("d" if hello["sni_present"] else "i")
+         + f"{min(len(ciphers), 99):02d}{min(len(extensions), 99):02d}"
+         + _alpn_code(hello["alpn"]))
+    zero = "0" * 12
+    b = (_truncate_hash(",".join(sorted(f"{c:04x}" for c in ciphers)))
+         if ciphers else zero)
+    if extensions:
+        # SNI and ALPN are counted above but left out of the hash: both are
+        # about who is being called, not about what is calling.
+        text = ",".join(sorted(f"{e:04x}" for e in extensions
+                               if e not in (0x0000, 0x0010)))
+        if 0x000D in extensions:
+            text += "_" + ",".join(f"{s:04x}" for s in hello["sigalgs"])
+        c = _truncate_hash(text)
+    else:
+        c = zero
+    return f"{a}_{b}_{c}"
+
+
+async def read_until(reader, complete, cap: int, timeout: float) -> bytes:
+    """Accumulate bytes until complete(buf), or the cap or the clock stops us.
+
+    A fingerprint is a hash of a whole structure, so one read() of whatever
+    the first segment carried is not enough: the client's KEXINIT and its
+    ClientHello both routinely arrive in pieces.
+    """
+    buf = b""
+    deadline = time.monotonic() + timeout
+    while len(buf) < cap and not complete(buf):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        try:
+            chunk = await asyncio.wait_for(reader.read(READ_LIMIT), timeout=left)
+        except Exception:
+            break
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+def _ssh_packet_complete(buf: bytes) -> bool:
+    return len(buf) >= 4 and len(buf) >= 4 + struct.unpack(">I", buf[:4])[0]
+
+
+def _hello_complete(buf: bytes) -> bool:
+    # Stop early on anything that is not a TLS handshake record: an SSLv2
+    # hello, plain HTTP sent to 443, or a scanner's own probe string.
+    return buf[:1] not in (b"", b"\x16") or parse_client_hello(buf) is not None
+
+
+class TlsStream:
+    """StreamReader and StreamWriter, near enough, over an ssl.SSLObject.
+
+    The https port has to listen in the clear so the ClientHello can be read
+    before the standard library eats it. That leaves the handshake and the
+    record layer to us, and this is the adapter that lets the existing
+    do_http() run on top of it unchanged.
+    """
+
+    def __init__(self, reader, writer, tls: ssl.SSLObject,
+                 incoming: ssl.MemoryBIO, outgoing: ssl.MemoryBIO) -> None:
+        self._reader = reader
+        self._writer = writer
+        self._tls = tls
+        self._incoming = incoming
+        self._outgoing = outgoing
+        self._buf = b""
+
+    async def _fill(self) -> bool:
+        """Decrypt more application data. False once nothing more is coming."""
+        while True:
+            try:
+                data = self._tls.read(READ_LIMIT)
+            except ssl.SSLWantReadError:
+                data = None
+            except ssl.SSLError:
+                return False
+            if data:
+                self._buf += data
+                return True
+            if data == b"":
+                return False
+            chunk = await self._reader.read(READ_LIMIT)
+            if not chunk:
+                with contextlib.suppress(ssl.SSLError):
+                    self._incoming.write_eof()
+                return False
+            self._incoming.write(chunk)
+            await self.drain()          # session tickets, renegotiation
+
+    async def readline(self) -> bytes:
+        while b"\n" not in self._buf:
+            if not await self._fill():
+                break
+        line, sep, rest = self._buf.partition(b"\n")
+        self._buf = rest
+        return line + sep
+
+    async def read(self, size: int) -> bytes:
+        if not self._buf and not await self._fill():
+            return b""
+        data, self._buf = self._buf[:size], self._buf[size:]
+        return data
+
+    def write(self, data: bytes) -> None:
+        with contextlib.suppress(ssl.SSLError):
+            self._tls.write(data)
+
+    async def drain(self) -> None:
+        data = self._outgoing.read()
+        if data:
+            self._writer.write(data)
+            await self._writer.drain()
+
+    def close(self) -> None:
+        self._writer.close()
+
+    async def wait_closed(self) -> None:
+        await self._writer.wait_closed()
+
+
+# ---------------------------------------------------------------------------
 # Sentinel
 # ---------------------------------------------------------------------------
 
 class Sentinel:
     def __init__(self, sink: JsonlSink, persona: dict[str, object],
-                 identity: Identity, quiet: bool, hold: bool) -> None:
+                 identity: Identity, quiet: bool, hold: bool,
+                 ssl_context: ssl.SSLContext | None = None) -> None:
         self.sink = sink
         self.persona = persona
         self.identity = identity
         self.quiet = quiet
         self.hold_enabled = hold
+        self.ssl_context = ssl_context
         self.tracker = Tracker()
         self.open_conns = 0
         self.body = (
@@ -522,12 +868,18 @@ class Sentinel:
         writer.write(ssh_kexinit())
         await writer.drain()
 
-        with contextlib.suppress(Exception):
-            data = await asyncio.wait_for(reader.read(READ_LIMIT),
-                                          timeout=TIMEOUTS["ssh"])
-            note["bytes_received"] = note.get("bytes_received", 0) + len(data)
-            if data and data[5:6] == bytes([20]):
-                note["ssh_kexinit_received"] = True
+        # Read the client's own KEXINIT whole rather than whatever the first
+        # segment happened to carry: HASSH is a hash of all four lists, so a
+        # packet split across segments is a packet with no fingerprint.
+        data = await read_until(reader, _ssh_packet_complete,
+                                65536, TIMEOUTS["ssh"])
+        note["bytes_received"] = note.get("bytes_received", 0) + len(data)
+        if data[5:6] == bytes([20]):
+            note["ssh_kexinit_received"] = True
+        lists = parse_kexinit(data)
+        if lists:
+            note["ssh_hassh"] = hassh(lists)
+            note["ssh_kex_client"] = lists["kex"][:512]
 
         # Stop here. Completing the key exchange needs a host key signature,
         # and there is no signing primitive in the standard library. Going
@@ -556,13 +908,16 @@ class Sentinel:
             requests.append(request)
 
             headers: dict[str, str] = {}
+            header_lines: list[str] = []
             for _ in range(64):
                 with contextlib.suppress(Exception):
                     hline = await asyncio.wait_for(
                         reader.readline(), timeout=TIMEOUTS["http_header"])
                     if not hline or hline in (b"\r\n", b"\n"):
                         break
-                    key, _, value = hline.decode("utf-8", "replace").partition(":")
+                    text = hline.decode("utf-8", "replace")
+                    header_lines.append(text)
+                    key, _, value = text.partition(":")
                     headers[key.strip().lower()] = value.strip()[:256]
                     continue
                 break
@@ -576,6 +931,16 @@ class Sentinel:
             method = parts[0] if parts else ""
             target = parts[1] if len(parts) > 1 else "/"
             keep = headers.get("connection", "").lower() != "close"
+
+            # Which headers, in which order, hashed with the protocol
+            # version. Every library and every scanner has its own habits
+            # here, and they survive a change of address or user-agent.
+            if first and header_lines:
+                order, digest = header_fingerprint(
+                    header_lines,
+                    parts[2] if len(parts) > 2 else "HTTP/0.9")
+                note["http_header_order"] = order
+                note["http_header_hash"] = digest
 
             await self.jitter()
             if method not in ("GET", "HEAD"):
@@ -598,6 +963,59 @@ class Sentinel:
 
         if requests:
             note["http_requests"] = requests[:16]
+
+    async def do_https(self, reader, writer, note: dict[str, object],
+                       port: int) -> None:
+        """Read the ClientHello ourselves, then hand the rest to do_http.
+
+        asyncio's own TLS support would complete the handshake before any of
+        this ran, and the ClientHello is the interesting part: JA4 identifies
+        the client's TLS library and its build far more sharply than a
+        user-agent string, which is only ever what the client chose to say.
+        """
+        buf = await read_until(reader, _hello_complete, 16384,
+                               TIMEOUTS["http_header"])
+        note["bytes_received"] = note.get("bytes_received", 0) + len(buf)
+        hello = parse_client_hello(buf)
+        if hello is None:
+            if buf:
+                note["payload_hex"] = buf[:512].hex()
+            return
+
+        note["tls_ja4"] = ja4(hello)
+        note["tls_version"] = hello["version"]
+        if hello["sni"]:
+            note["tls_sni"] = hello["sni"]
+        if hello["alpn"]:
+            note["tls_alpn"] = hello["alpn"][0].decode("utf-8", "replace")[:32]
+
+        if self.ssl_context is None:
+            return
+        incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+        tls = self.ssl_context.wrap_bio(incoming, outgoing, server_side=True)
+        incoming.write(buf)
+        stream = TlsStream(reader, writer, tls, incoming, outgoing)
+        while True:
+            try:
+                tls.do_handshake()
+                done = True
+            except ssl.SSLWantReadError:
+                done = False
+            except ssl.SSLError:
+                # A client that will not negotiate has already told us
+                # everything it was going to. Drop it the way a server with
+                # no shared cipher does, without a word.
+                return
+            await stream.drain()
+            if done:
+                break
+            chunk = await asyncio.wait_for(reader.read(READ_LIMIT),
+                                           timeout=TIMEOUTS["http_header"])
+            if not chunk:
+                return
+            incoming.write(chunk)
+
+        await self.do_http(stream, stream, note, port)
 
     def http_404(self, server: str) -> bytes:
         if "Apache" in server:
@@ -782,7 +1200,9 @@ class Sentinel:
                 "mysql": self.do_mysql,
             }.get(role)
             with contextlib.suppress(Exception):
-                if role in ("http", "https"):
+                if role == "https":
+                    await self.do_https(reader, writer, note, port)
+                elif role == "http":
                     await self.do_http(reader, writer, note, port)
                 elif handler is not None:
                     await handler(reader, writer, note)
@@ -831,20 +1251,20 @@ class Sentinel:
                 writer.close()
                 await writer.wait_closed()
 
-    async def serve(self, host: str, ports: dict[int, str],
-                    ssl_context: object | None) -> None:
+    async def serve(self, host: str, ports: dict[int, str]) -> None:
         servers, opened, refused = [], [], []
         for port, role in sorted(ports.items()):
-            kwargs = {}
-            if role == "https":
-                if ssl_context is None:
-                    refused.append((port, "no certificate supplied"))
-                    continue
-                kwargs["ssl"] = ssl_context
+            # https listens in the clear and does its own handshake, so that
+            # do_https() sees the ClientHello. The certificate is still
+            # required: a port that cannot complete a handshake is worse
+            # than a closed one.
+            if role == "https" and self.ssl_context is None:
+                refused.append((port, "no certificate supplied"))
+                continue
             try:
                 server = await asyncio.start_server(
                     lambda r, w, p=port, x=role: self.handle(r, w, p, x),
-                    host, port, **kwargs,
+                    host, port,
                 )
             except OSError as exc:
                 refused.append((port, exc.strerror or str(exc)))
@@ -874,7 +1294,10 @@ class Sentinel:
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            with contextlib.suppress(NotImplementedError):
+            # Not on Windows, and not off the main thread, which is where the
+            # selftest runs it. Neither is a reason to refuse to serve.
+            with contextlib.suppress(NotImplementedError, ValueError,
+                                     RuntimeError):
                 loop.add_signal_handler(sig, stop.set)
         await stop.wait()
         print("stopping", flush=True)
@@ -882,7 +1305,144 @@ class Sentinel:
             server.close()
 
 
-def main() -> int:
+# ---------------------------------------------------------------------------
+# Selftest
+# ---------------------------------------------------------------------------
+
+def _hello_bytes(*, sni: bool = True, alpn=(b"h2", b"http/1.1"),
+                 versions=(0x0A0A, 0x0304), records: int = 1) -> bytes:
+    """A ClientHello built by hand, so the parser is checked against bytes
+    nobody generated with the same code that reads them."""
+    def ext(kind: int, body: bytes) -> bytes:
+        return struct.pack(">HH", kind, len(body)) + body
+
+    extensions = b""
+    if sni:
+        entry = b"\x00" + struct.pack(">H", 11) + b"example.com"
+        extensions += ext(0x0000, struct.pack(">H", len(entry)) + entry)
+    offered = b"".join(struct.pack(">H", v) for v in versions)
+    extensions += ext(0x002B, bytes([len(offered)]) + offered)
+    if alpn:
+        protocols = b"".join(bytes([len(p)]) + p for p in alpn)
+        extensions += ext(0x0010, struct.pack(">H", len(protocols)) + protocols)
+    sigalgs = struct.pack(">HH", 0x0403, 0x0804)
+    extensions += ext(0x000D, struct.pack(">H", len(sigalgs)) + sigalgs)
+    extensions += ext(0x0017, b"")                  # zero length, on purpose
+    ciphers = struct.pack(">HHH", 0x1A1A, 0x1301, 0x1302)
+    body = (struct.pack(">H", 0x0303) + bytes(32) + b"\x00"
+            + struct.pack(">H", len(ciphers)) + ciphers
+            + b"\x01\x00"                           # one compression method
+            + struct.pack(">H", len(extensions)) + extensions)
+    message = bytes([1]) + len(body).to_bytes(3, "big") + body
+    if records == 1:
+        return b"\x16\x03\x01" + struct.pack(">H", len(message)) + message
+    cut = len(message) // 2
+    return (b"\x16\x03\x01" + struct.pack(">H", cut) + message[:cut]
+            + b"\x16\x03\x01" + struct.pack(">H", len(message) - cut)
+            + message[cut:])
+
+
+def _selftest_live() -> None:
+    """One real connection to each of two ports, through the real server."""
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="sentinel-selftest-"))
+    log = tmp / "connections.jsonl"
+    threading.Thread(target=main, daemon=True, args=([
+        "--host", "127.0.0.1", "--port-offset", "40000", "--no-hold",
+        "--quiet", "--log", str(log), "--identity", str(tmp / "identity.json"),
+    ],)).start()
+
+    def connect(port: int) -> socket.socket:
+        for _ in range(100):
+            with contextlib.suppress(OSError):
+                return socket.create_connection(("127.0.0.1", port), timeout=5)
+            time.sleep(0.05)
+        raise AssertionError(f"nothing came up on {port}")
+
+    client = connect(40022)
+    client.recv(512)                                # the server's ident
+    client.sendall(b"SSH-2.0-Test\r\n" + ssh_kexinit())
+    client.close()
+
+    client = connect(40080)
+    client.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nUser-Agent: y\r\n\r\n")
+    assert client.recv(4096).startswith(b"HTTP/1.1 200 ")
+    client.close()
+
+    want = hashlib.md5(
+        f"{SSH_KEX};{SSH_CIPHER};{SSH_MAC};{SSH_COMPRESSION}".encode(),
+        usedforsecurity=False).hexdigest()
+    events: list[dict] = []
+    for _ in range(100):
+        time.sleep(0.05)
+        if not log.exists():
+            continue
+        events = [json.loads(line) for line
+                  in log.read_text(encoding="utf-8").splitlines() if line]
+        if (any(e.get("ssh_hassh") for e in events)
+                and any(e.get("http_header_order") for e in events)):
+            break
+    assert any(e.get("ssh_hassh") == want for e in events), events
+    assert any(e.get("ssh_kex_client") == SSH_KEX for e in events), events
+    assert any(e.get("http_header_order") == "host,user-agent"
+               for e in events), events
+
+
+def selftest() -> int:
+    lists = parse_kexinit(ssh_kexinit())
+    assert lists is not None
+    assert lists["kex"] == SSH_KEX, lists["kex"]
+    assert lists["enc_c2s"] == SSH_CIPHER, lists["enc_c2s"]
+    assert lists["mac_c2s"] == SSH_MAC, lists["mac_c2s"]
+    assert lists["comp_c2s"] == SSH_COMPRESSION, lists["comp_c2s"]
+    assert lists["lang_c2s"] == "", lists["lang_c2s"]
+    assert hassh(lists) == hashlib.md5(
+        f"{SSH_KEX};{SSH_CIPHER};{SSH_MAC};{SSH_COMPRESSION}".encode(),
+        usedforsecurity=False).hexdigest(), hassh(lists)
+    assert parse_kexinit(ssh_kexinit()[:20]) is None
+    assert parse_kexinit(ssh_packet(bytes([21]) + os.urandom(16))) is None
+    assert parse_kexinit(b"") is None
+
+    hello = parse_client_hello(_hello_bytes())
+    assert hello is not None
+    assert hello["version"] == "13", hello["version"]
+    assert hello["sni"] == "example.com", hello["sni"]
+    assert hello["ciphers"] == [0x1301, 0x1302], hello["ciphers"]
+    assert hello["alpn"][0] == b"h2", hello["alpn"]
+    assert hello["sigalgs"] == [0x0403, 0x0804], hello["sigalgs"]
+    assert len(hello["extensions"]) == 5, hello["extensions"]
+
+    print_ = ja4(hello)
+    assert re.fullmatch(r"t13d02\d\dh2_[0-9a-f]{12}_[0-9a-f]{12}", print_), print_
+    assert print_[6:8] == "05", print_
+    assert print_.split("_")[1] == hashlib.sha256(
+        b"1301,1302").hexdigest()[:12], print_
+    assert ja4(parse_client_hello(_hello_bytes(records=2))) == print_
+    assert ja4(parse_client_hello(_hello_bytes(alpn=()))) .startswith(
+        "t13d020400_"), "alpn absent"
+    assert ja4(parse_client_hello(_hello_bytes(sni=False))).startswith(
+        "t13i0204h2_"), "sni absent"
+    assert parse_client_hello(
+        _hello_bytes(versions=(0x0A0A,)))["version"] == "12"
+    assert parse_client_hello(b"\x80\x2e\x01\x03\x01") is None      # SSLv2
+    assert parse_client_hello(b"GET / HTTP/1.1\r\n\r\n") is None
+    assert parse_client_hello(_hello_bytes()[:20]) is None          # fragment
+
+    order, digest = header_fingerprint(["Host: x", "User-Agent: y"], "HTTP/1.1")
+    assert order == "host,user-agent", order
+    assert re.fullmatch(r"[0-9a-f]{12}", digest), digest
+    assert header_fingerprint(["Host: x", "User-Agent: y"],
+                              "HTTP/1.0")[1] != digest
+    assert header_fingerprint(["User-Agent: y", "Host: x"],
+                              "HTTP/1.1")[1] != digest
+    assert header_fingerprint(["Accept: a", "Accept: b"],
+                              "HTTP/1.1")[0] == "accept,accept"
+
+    _selftest_live()
+    print("selftest ok")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--host", default="127.0.0.1",
                     help="bind address. The default is loopback. This sensor "
@@ -915,7 +1475,14 @@ def main() -> int:
     ap.add_argument("--no-hold", action="store_true",
                     help="observe only, never keep a connection open")
     ap.add_argument("--quiet", action="store_true")
-    args = ap.parse_args()
+    ap.add_argument("--selftest", action="store_true",
+                    help="check the fingerprint parsers and one loopback "
+                         "connection, then exit. Touches no network the "
+                         "machine can see")
+    args = ap.parse_args(argv)
+
+    if args.selftest:
+        return selftest()
 
     persona = PERSONAS[args.persona]
     roles: dict[int, str] = dict(persona["roles"])  # type: ignore[arg-type]
@@ -937,7 +1504,6 @@ def main() -> int:
 
     ssl_context = None
     if args.tls_cert and args.tls_key:
-        import ssl
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_context.load_cert_chain(args.tls_cert, args.tls_key)
 
@@ -955,9 +1521,10 @@ def main() -> int:
               file=sys.stderr, flush=True)
 
     sink = JsonlSink(str(log_path))
-    sentinel = Sentinel(sink, persona, identity, args.quiet, not args.no_hold)
+    sentinel = Sentinel(sink, persona, identity, args.quiet, not args.no_hold,
+                        ssl_context)
     try:
-        asyncio.run(sentinel.serve(args.host, roles, ssl_context))
+        asyncio.run(sentinel.serve(args.host, roles))
     except KeyboardInterrupt:
         pass
     finally:

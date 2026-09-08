@@ -68,6 +68,25 @@ del(.ip)
 del(.http_user_agent)
 del(.http_host)
 
+# An address is cheap identity: rented, rotated, shared. A protocol stack is
+# expensive identity. HASSH is the client's SSH algorithm lists, JA4 the shape
+# of its TLS ClientHello, and the HTTP hash the order of its headers; all
+# three are properties of the tool rather than of where it is running, so they
+# hold across a change of address and are what the campaign clustering groups
+# on. Most connections carry none of them, and this transform drops the whole
+# event on any error, so every move is guarded by exists(). del() returns the
+# value it removes, which is what makes each line a move rather than a copy.
+if exists(.ssh_hassh) { .fingerprint.hassh = del(.ssh_hassh) }
+if exists(.tls_ja4) { .fingerprint.ja4 = del(.tls_ja4) }
+if exists(.http_header_hash) { .fingerprint.http = del(.http_header_hash) }
+if exists(.tls_sni) { .tls.sni = del(.tls_sni) }
+if exists(.tls_alpn) { .tls.alpn = del(.tls_alpn) }
+if exists(.tls_version) { .tls.version = del(.tls_version) }
+if exists(.http_header_order) { .http.header_order = del(.http_header_order) }
+# ssh_client stays where it is: the dashboards and the tool test below read
+# it flat, and the banner is a claim rather than a measurement.
+if exists(.ssh_kex_client) { .ssh.kex = del(.ssh_kex_client) }
+
 # Which tool this looks like, from what the client volunteered. The SSH
 # banner is the most honest signal: Go's ssh library announces itself as
 # exactly "SSH-2.0-Go", and the "PUTTY" spelling is a brute-forcer imitating
