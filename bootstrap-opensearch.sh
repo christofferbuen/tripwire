@@ -339,6 +339,7 @@ api PUT /_index_template/tripwire "$(cat <<'EOF'
 
         "body_excerpt":  { "type": "text",    "index": true },
         "payload_text":  { "type": "text",    "index": true },
+        "http_body":     { "type": "text",    "index": true },
         "payload_hex":   { "type": "keyword", "index": false }
       }
     }
@@ -371,6 +372,7 @@ if api GET "/_cat/indices/tripwire-*?h=index" | grep -q tripwire; then
     "fingerprint":{"properties":{"hassh":{"type":"keyword"},"ja4":{"type":"keyword"},"http":{"type":"keyword"}}},
     "tls":{"properties":{"sni":{"type":"keyword"},"alpn":{"type":"keyword"},"version":{"type":"keyword"}}},
     "ssh":{"properties":{"kex":{"type":"keyword"}}},
+    "http_body":{"type":"text"},
     "prior":{"properties":{"sentinel_first_seen":{"type":"date"},"receiver_first_seen":{"type":"date"},
              "sentinel_hours":{"type":"float"}}},
     "enrichment":{"properties":{"at":{"type":"date"}}}}}' > /dev/null || true

@@ -946,6 +946,23 @@ class Sentinel:
                 note["http_header_order"] = order
                 note["http_header_hash"] = digest
 
+            # Read the body a real server would read before answering. It is
+            # also where the interesting part of a POST lives: the router
+            # exploit's command injection, the credentials for the login
+            # form. First 4 KiB kept, the rest drained and dropped.
+            try:
+                length = min(int(headers.get("content-length", "0")), 1 << 20)
+            except ValueError:
+                length = 0
+            if length:
+                body = b""
+                with contextlib.suppress(Exception):
+                    body = await asyncio.wait_for(
+                        reader.readexactly(length), timeout=TIMEOUTS["http_header"])
+                note["bytes_received"] = note.get("bytes_received", 0) + len(body)
+                if body and "http_body" not in note:
+                    note["http_body"] = body[:4096].decode("utf-8", "replace")
+
             await self.jitter()
             if method not in ("GET", "HEAD"):
                 writer.write(self.http_response(
@@ -1372,6 +1389,12 @@ def _selftest_live() -> None:
     assert client.recv(4096).startswith(b"HTTP/1.1 200 ")
     client.close()
 
+    client = connect(40080)
+    client.sendall(b"POST /boaform/admin/formLogin HTTP/1.1\r\nHost: x\r\n"
+                   b"Content-Length: 18\r\n\r\nusername=admin&p=1")
+    assert client.recv(4096).startswith(b"HTTP/1.1 405 ")
+    client.close()
+
     want = hashlib.md5(
         f"{SSH_KEX};{SSH_CIPHER};{SSH_MAC};{SSH_COMPRESSION}".encode(),
         usedforsecurity=False).hexdigest()
@@ -1383,12 +1406,13 @@ def _selftest_live() -> None:
         events = [json.loads(line) for line
                   in log.read_text(encoding="utf-8").splitlines() if line]
         if (any(e.get("ssh_hassh") for e in events)
-                and any(e.get("http_header_order") for e in events)):
+                and any(e.get("http_body") for e in events)):
             break
     assert any(e.get("ssh_hassh") == want for e in events), events
     assert any(e.get("ssh_kex_client") == SSH_KEX for e in events), events
     assert any(e.get("http_header_order") == "host,user-agent"
                for e in events), events
+    assert any(e.get("http_body") == "username=admin&p=1" for e in events), events
 
 
 def selftest() -> int:

@@ -165,6 +165,14 @@ kept verbatim in `http.header_order`. Two scanners with different addresses
 and the same HASSH are the same program. `python3 sentinel.py --selftest`
 checks the parsers against known bytes.
 
+What it records of the conversation itself: the SSH banner, request lines
+and the first 4 KiB of a POST body on the web ports (the router exploits
+and the credential sprays live there), up to 24 SMTP commands including
+AUTH, the MySQL login name, and the raw bytes on anything that was not the
+expected protocol. SSH passwords are never seen: the key exchange is never
+completed, on purpose. `CLAUDE.md` has the field table and the saved
+searches that show all of it in Dashboards.
+
 Each connection is filed as one of:
 
 | Classification | Means |

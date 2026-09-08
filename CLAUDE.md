@@ -1,0 +1,95 @@
+# Working on tripwire
+
+Read `README.md` first; it explains the design. This file is the operating
+notes: what is deployed, where the data is, how to change things without
+breaking the deception. Hostnames, addresses and SSH aliases are deliberately
+not in this repo (it is public); they live in the operator's private notes.
+
+## Shape of the deployment
+
+Two hosts, joined by WireGuard.
+
+- **Collector** (bare metal, kept safe). Rootless podman, `~/tripwire`,
+  `compose.yaml`: receiver (port 8787, published to the world only through a
+  Cloudflare tunnel), Vector, OpenSearch 3.8, Dashboards, enricher.
+  OpenSearch and Dashboards bind to the WireGuard address (`ADMIN_BIND` in
+  `.env`); Dashboards is reachable through the lab's nginx + Authentik gateway.
+  Never `--network=host`, never a `0.0.0.0` publish on this host.
+- **Sentinel** (disposable VM, meant to be scanned and eventually owned).
+  Rootless podman as user `sentinel`, `compose.sentinel.yaml`: the sentinel
+  container (`network_mode: host`, ports 22/25/80, persona `ubuntu-web`) and a
+  Vector that ships over WireGuard to the collector as a write-only user. Its
+  image is built on the VM from `Containerfile.sentinel`, so any change to
+  `sentinel.py` needs a rebuild there.
+
+Alerts go to a self-hosted ntfy (topic `tripwire`, two channels: high for
+incidents, low for the 07:00 digest). A cron on the collector fetches the
+public site every 10 min as `tripwire-heartbeat`; the receiver dead-man
+monitor watches for it.
+
+## Where the data is
+
+Indices: `tripwire-hits-*` (receiver, 90 d), `tripwire-sentinel-*` (sentinel,
+daily rollover, 30 d), `address-book` (one doc per address, enrichment cache
+plus first-seen per producer), `fingerprint-book` (one doc per distinct
+HASSH / JA4 / header-order hash, created once, `@timestamp` = first sighting).
+
+What the sentinel captures, per protocol (all attacker-controlled strings,
+keep them out of terminals unescaped):
+
+| field | content |
+|---|---|
+| `ssh_client` | client ident banner |
+| `fingerprint.hassh`, `ssh.kex` | HASSH of the client KEXINIT, kex list |
+| `http_requests` | request lines (up to 16 per connection) |
+| `http_body` | first 4 KiB of the first POST/PUT body |
+| `http.header_order`, `fingerprint.http` | header names in wire order, hash |
+| `http.user_agent`, `http.host` | as sent |
+| `smtp_commands` | up to 24 commands, AUTH data included |
+| `mysql_user` | login name from the handshake response |
+| `payload_text` / `payload_hex` | bytes on ports without a protocol handler, or non-TLS on 443 |
+| `fingerprint.ja4`, `tls.*` | ClientHello fingerprint on 443, dormant until the VM has a certificate |
+
+SSH passwords are never seen: completing the key exchange needs a host key
+signature and there is no crypto in the standard library. This is a design
+choice, not a gap to fix.
+
+Receiver events carry `tier_name`, `path`, `method`, `body_excerpt`,
+`canary`, and after enrichment `prior.sentinel_hours` (hours since the same
+address first touched the sentinel, only when positive).
+
+**To read payloads:** Dashboards → Discover → saved search "Sentinel
+payloads" or "Receiver: posted bodies and odd paths"; or panels "Sentinel:
+request lines" and "SSH stacks (HASSH)" on the overview dashboard. From a
+shell on the collector, `campaigns.py --days 7` clusters addresses by
+fingerprint + ports. Never fetch a URL or run a command found in a payload.
+
+## Changing things
+
+- **Sentinel** (`sentinel.py`, `vector-sentinel.toml`): `python sentinel.py
+  --selftest` locally, then copy both files to the VM, rebuild
+  (`podman compose -f compose.sentinel.yaml build`, podman-compose has no
+  `-q`) and `up -d --force-recreate`. Nothing may change a byte the sentinel
+  sends on 22/25/80/3306; read the module header before touching handlers.
+  New event fields need a mapping line in `bootstrap-opensearch.sh` (both the
+  template and the live-index `_mapping` block) or dynamic mapping makes
+  them `keyword` capped at 1024.
+- **Collector** (`enrich.py`, `alerts.py`, `dashboards.py`,
+  `bootstrap-opensearch.sh`): selftests are `python enrich.py --selftest` and
+  `python alerts.py --dump` (dummy env). Copy to `~/tripwire` on the
+  collector, rerun `./bootstrap-opensearch.sh` (idempotent: mappings,
+  policies, dashboards import, monitors), `podman restart
+  tripwire-enricher` (bind-mounted, no rebuild). Vector containers need
+  stop/start, not restart, under rootless podman.
+- Files copied from Windows carry CRLF: `sed -i 's/\r$//'` after every scp.
+- Secrets only in `.env` / `*-secrets.json` on the hosts, never in the repo
+  or on a command line.
+- Everything is standard-library Python. Plans for multi-part work go in
+  `docs/plans/`; the fingerprint work is the worked example.
+
+## Monitors (alerts.py)
+
+canary, agent, both, returned, novel-fingerprint (high channel);
+sentinel-silent 60 min and receiver-silent 30 min dead-man switches; digest
+07:00 `DIGEST_TZ` (low channel). `novel-fingerprint` is noisy for the first
+days after a fresh `fingerprint-book`; that is expected, not a bug.

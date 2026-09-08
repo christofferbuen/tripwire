@@ -145,6 +145,11 @@ VISUALISATIONS = [
     pie("tw-tools", "Tools", "threat.tool"),
     table("tw-lists", "On lists", "threat.lists"),
     table("tw-ptr", "Reverse DNS", "source.domain", size=20),
+    # What they actually asked for. Request lines carry the exploit paths
+    # (/boaform/, /.env, the Mozi dropper in the query string); the
+    # fingerprint says which program sent them, across addresses.
+    table("tw-requests", "Sentinel: request lines", "http_requests", SENTINEL, size=20),
+    table("tw-hassh", "SSH stacks (HASSH)", "fingerprint.hassh", SENTINEL),
 ]
 
 SEARCHES = [
@@ -157,6 +162,14 @@ SEARCHES = [
                   "source.as.organization_name", "threat.scanner", "threat.tool",
                   "port", "role", "classification", "ssh_client",
                   "distinct_ports"]),
+    # The payload views: open these in Discover to read what was sent.
+    saved_search("tw-search-payloads", "Sentinel payloads",
+                 SENTINEL + " and (http_requests:* or http_body:* or smtp_commands:* or mysql_user:* or payload_text:*)",
+                 ["source.ip", "port", "threat.tool", "fingerprint.hassh", "fingerprint.http",
+                  "http_requests", "http_body", "smtp_commands", "mysql_user", "payload_text"]),
+    saved_search("tw-search-bodies", "Receiver: posted bodies and odd paths",
+                 RECEIVER + " and (body_excerpt:* or tier_name:(collection-post or instruction-follower or tarpit))",
+                 ["source.ip", "tier_name", "method", "path", "http.user_agent", "body_excerpt", "canary"]),
 ]
 
 # (id, x, y, w, h) on a 48-column grid.
@@ -176,6 +189,8 @@ LAYOUT = [
     ("tw-lists", 24, 62, 12, 16),
     ("tw-ptr", 36, 62, 12, 16),
     ("tw-agents", 0, 78, 48, 14),
+    ("tw-requests", 0, 92, 32, 16),
+    ("tw-hassh", 32, 92, 16, 16),
 ]
 
 
