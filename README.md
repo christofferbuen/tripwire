@@ -201,6 +201,13 @@ podman compose up -d
 `setup-logging.sh` generates the admin password and never prints it. Read it
 out of `.env` when the dashboard asks.
 
+Every hit gets country, city and network owner at ingest, from the
+geospatial plugin's `ip2geo` processor and the GeoLite2 mirror the
+OpenSearch project runs (`geoip.maps.opensearch.org`). The database is
+downloaded to the cluster and refreshed every three days; lookups are local,
+so no address is ever sent anywhere. Fields land under `source.geo.*` and
+`source.as.*`.
+
 `bootstrap-opensearch.sh` also creates the `tripwire` index pattern and
 imports the "Tripwire overview" dashboard, which `dashboards.py` generates.
 Both go into the Global tenant, so every login sees them. Edit

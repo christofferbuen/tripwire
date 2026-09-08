@@ -100,6 +100,23 @@ def timeline(vid, title, split_field):
     return vis(vid, title, "histogram", aggs, params)
 
 
+def world_map(vid, title):
+    """Coordinate map on source.geo.location. Tiles come from
+    maps.opensearch.org, fetched by the browser, so this panel is blank when
+    the browser has no route out. Everything else works offline."""
+    aggs = [count(),
+            {"id": "2", "enabled": True, "type": "geohash_grid", "schema": "segment",
+             "params": {"field": "source.geo.location", "autoPrecision": True,
+                        "isFilteredByCollar": True, "useGeocentroid": True,
+                        "mapZoom": 2, "mapCenter": [20, 0], "precision": 2}}]
+    params = {"colorSchema": "Yellow to Red", "mapType": "Scaled Circle Markers",
+              "isDesaturated": True, "addTooltip": True, "heatClusterSize": 1.5,
+              "legendPosition": "bottomright", "mapZoom": 2, "mapCenter": [20, 0],
+              "wms": {"enabled": False, "options": {"format": "image/png",
+                                                    "transparent": True}}}
+    return vis(vid, title, "tile_map", aggs, params)
+
+
 def saved_search(sid, title, query, columns):
     return {"id": sid, "type": "search",
             "attributes": {"title": title, "columns": columns,
@@ -119,27 +136,36 @@ VISUALISATIONS = [
     table("tw-ports", "Sentinel: ports", "port", SENTINEL),
     table("tw-agents", "User agents", "http.user_agent"),
     table("tw-canaries", "Canaries that fired", "canary", RECEIVER),
+    world_map("tw-map", "Where from"),
+    table("tw-countries", "Countries", "source.geo.country_name"),
+    table("tw-orgs", "Networks", "source.as.organization_name"),
 ]
 
 SEARCHES = [
     saved_search("tw-search-receiver", "Receiver hits", RECEIVER,
-                 ["source.ip", "tier_name", "method", "path",
+                 ["source.ip", "source.geo.country_iso_code",
+                  "source.as.organization_name", "tier_name", "method", "path",
                   "http.user_agent", "canary"]),
     saved_search("tw-search-sentinel", "Sentinel connections", SENTINEL,
-                 ["source.ip", "port", "role", "classification",
-                  "http.user_agent", "ssh_client", "distinct_ports"]),
+                 ["source.ip", "source.geo.country_iso_code",
+                  "source.as.organization_name", "port", "role",
+                  "classification", "http.user_agent", "ssh_client",
+                  "distinct_ports"]),
 ]
 
 # (id, x, y, w, h) on a 48-column grid.
 LAYOUT = [
     ("tw-timeline", 0, 0, 48, 12),
-    ("tw-sources", 0, 12, 16, 16),
-    ("tw-tiers", 16, 12, 16, 16),
-    ("tw-class", 32, 12, 16, 16),
-    ("tw-paths", 0, 28, 16, 16),
-    ("tw-ports", 16, 28, 16, 16),
-    ("tw-canaries", 32, 28, 16, 16),
-    ("tw-agents", 0, 44, 48, 14),
+    ("tw-map", 0, 12, 24, 18),
+    ("tw-countries", 24, 12, 12, 18),
+    ("tw-orgs", 36, 12, 12, 18),
+    ("tw-sources", 0, 30, 16, 16),
+    ("tw-tiers", 16, 30, 16, 16),
+    ("tw-class", 32, 30, 16, 16),
+    ("tw-paths", 0, 46, 16, 16),
+    ("tw-ports", 16, 46, 16, 16),
+    ("tw-canaries", 32, 46, 16, 16),
+    ("tw-agents", 0, 62, 48, 14),
 ]
 
 

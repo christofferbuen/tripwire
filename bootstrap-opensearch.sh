@@ -136,6 +136,42 @@ EOF
 )" > /dev/null
 echo "  done"
 
+echo "Creating the GeoIP datasources."
+# The geospatial plugin's ip2geo processor, fed from the GeoLite2 mirror the
+# OpenSearch project runs. Downloaded once, refreshed every few days, looked
+# up locally at ingest. Nothing about a hit leaves the box.
+for ds in geolite2-city geolite2-asn; do
+  if ! api GET "/_plugins/geospatial/ip2geo/datasource/${ds}?filter_path=datasources.name" | grep -q "$ds"; then
+    api PUT "/_plugins/geospatial/ip2geo/datasource/${ds}" \
+      "{\"endpoint\":\"https://geoip.maps.opensearch.org/v1/${ds}/manifest.json\",\"update_interval_in_days\":3}" > /dev/null
+  fi
+done
+# The pipeline cannot reference a datasource that is still downloading.
+for _ in $(seq 1 60); do
+  api GET "/_plugins/geospatial/ip2geo/datasource?filter_path=datasources.state" \
+    | grep -qE 'CREATING|"state":"[A-Z]*_FAILED' || break
+  sleep 3
+done
+api GET "/_plugins/geospatial/ip2geo/datasource?filter_path=datasources.name,datasources.state" | sed 's/^/  /'
+echo
+
+echo "Creating the enrichment pipeline."
+api PUT /_ingest/pipeline/tripwire-enrich "$(cat <<'EOF'
+{
+  "description": "country, city and network owner for the client address",
+  "processors": [
+    { "ip2geo": { "field": "source.ip", "target_field": "source.geo", "datasource": "geolite2-city",
+                  "properties": ["country_iso_code", "country_name", "city_name", "location"],
+                  "ignore_missing": true } },
+    { "ip2geo": { "field": "source.ip", "target_field": "source.as", "datasource": "geolite2-asn",
+                  "properties": ["asn", "organization_name"],
+                  "ignore_missing": true } }
+  ]
+}
+EOF
+)" > /dev/null
+echo "  done"
+
 echo "Creating the index template."
 api PUT /_index_template/tripwire "$(cat <<'EOF'
 {
@@ -146,6 +182,7 @@ api PUT /_index_template/tripwire "$(cat <<'EOF'
       "number_of_shards": 1,
       "number_of_replicas": 0,
       "refresh_interval": "10s",
+      "default_pipeline": "tripwire-enrich",
       "mapping.total_fields.limit": 250,
       "mapping.depth.limit": 8,
       "mapping.ignore_malformed": true,
@@ -172,7 +209,21 @@ api PUT /_index_template/tripwire "$(cat <<'EOF'
         },
         "source": {
           "properties": {
-            "ip": { "type": "ip", "ignore_malformed": true }
+            "ip": { "type": "ip", "ignore_malformed": true },
+            "geo": {
+              "properties": {
+                "country_iso_code": { "type": "keyword" },
+                "country_name":     { "type": "keyword" },
+                "city_name":        { "type": "keyword" },
+                "location":         { "type": "geo_point", "ignore_malformed": true }
+              }
+            },
+            "as": {
+              "properties": {
+                "asn":               { "type": "keyword" },
+                "organization_name": { "type": "keyword" }
+              }
+            }
           }
         },
 
@@ -235,6 +286,17 @@ api PUT /_index_template/tripwire "$(cat <<'EOF'
 EOF
 )" > /dev/null
 echo "  done"
+
+# Templates only shape indices created later. Give the ones already open the
+# enrichment fields and pipeline too; read-only ones under ISM refuse and
+# that is fine, they are on their way out.
+if api GET "/_cat/indices/tripwire-*?h=index" | grep -q tripwire; then
+  api PUT "/tripwire-*/_settings" '{"index.default_pipeline":"tripwire-enrich"}' > /dev/null || true
+  api PUT "/tripwire-*/_mapping" '{"properties":{"source":{"properties":{
+    "geo":{"properties":{"country_iso_code":{"type":"keyword"},"country_name":{"type":"keyword"},
+           "city_name":{"type":"keyword"},"location":{"type":"geo_point","ignore_malformed":true}}},
+    "as":{"properties":{"asn":{"type":"keyword"},"organization_name":{"type":"keyword"}}}}}}}' > /dev/null || true
+fi
 
 echo "Creating the sentinel write alias."
 # Only ever created once; rollover takes it from here. Attaching the policy
