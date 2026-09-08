@@ -39,6 +39,16 @@ import sqlite3
 from collections import defaultdict
 from datetime import datetime, timedelta
 
+
+def clean(text):
+    """Escape control characters before they reach a terminal.
+
+    Everything in the database came from the client. A user agent holding an
+    ANSI sequence must not get to repaint the screen it is printed on.
+    """
+    return "".join(ch if ch.isprintable() else repr(ch)[1:-1]
+                   for ch in (text or ""))
+
 # Subresources the cover site's pages reference. A browser fetches these
 # automatically; something reading the HTML as text does not.
 BEACONS = {
@@ -240,8 +250,8 @@ def main() -> int:
         for row in rows:
             print(f"  tw-{row['token']}")
             print(f"    taken   {row['ts']} by {row['ip']}")
-            print(f"    as      {row['kind']} at {row['path']}")
-            print(f"    agent   {row['user_agent']}")
+            print(f"    as      {row['kind']} at {clean(row['path'])}")
+            print(f"    agent   {clean(row['user_agent'])}")
         print("\nIf one of these is ever presented anywhere, look it up here "
               "to name the exact fetch that leaked it.")
         return 0
@@ -265,7 +275,7 @@ def main() -> int:
         print(f"{label}{'  [' + ', '.join(flags) + ']' if flags else ''}")
         print(f"  when       {first['ts']}  (+{int(span.total_seconds())}s)")
         print(f"  address    {first['ip']}")
-        print(f"  user-agent {first['user_agent']}")
+        print(f"  user-agent {clean(first['user_agent'])}")
         if placements:
             print(f"  placement  {', '.join(placements)}")
         print(f"  requests   {len(visit)}")
@@ -275,13 +285,13 @@ def main() -> int:
             extra = f"  d{depth}" if depth is not None else ""
             ms = int(get(row, "held_ms", 0))
             extra += f"  held {ms / 1000:.1f}s" if ms else ""
-            print(f"    t{row['tier']}  {row['method']:4} {row['path']}{q}{extra}")
+            print(f"    t{row['tier']}  {row['method']:4} {clean(row['path'])}{clean(q)}{extra}")
         if args.show_bodies:
             for row in visit:
                 if row["body_excerpt"]:
                     print(f"  body ({row['body_len']} bytes):")
                     for line in row["body_excerpt"].splitlines():
-                        print(f"    | {line}")
+                        print(f"    | {clean(line)}")
 
     print(f"\n{'=' * 72}")
     print(f"{len(visits)} visits from {len(rows)} hits")

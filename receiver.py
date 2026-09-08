@@ -40,6 +40,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from hashlib import blake2b
+from html import escape as html_escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -396,7 +397,8 @@ def tarpit_rng(path: str) -> random.Random:
 def tarpit_listing(path: str, depth: int, token: str) -> bytes:
     """A plausible open directory index for a path that does not exist."""
     rng = tarpit_rng(path)
-    base = path if path.endswith("/") else path + "/"
+    # The path is attacker text and lands in the page three times.
+    base = html_escape(path if path.endswith("/") else path + "/", quote=True)
 
     entries: list[tuple[str, str, str]] = []  # (href, name, size)
     if depth < TARPIT_MAX_DEPTH:
@@ -555,6 +557,11 @@ def make_handler(store: Store, pages: dict[str, tuple[str, bytes]],
         server_version = "nginx"
         sys_version = ""
         protocol_version = "HTTP/1.1"
+        # Socket timeout for every blocking read and write. A client that
+        # opens a connection and sends nothing otherwise holds a thread for
+        # ever; the tarpit's own sleeps sit between writes, so they are
+        # unaffected.
+        timeout = 60
 
         # -- helpers ---------------------------------------------------
 
