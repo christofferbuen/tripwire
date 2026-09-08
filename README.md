@@ -154,6 +154,17 @@ Four tells it cannot fix from inside a container, and you have to handle:
 the PTR record, the address's reputation and allocation, the TLS certificate,
 and the host's history.
 
+It also fingerprints the client's protocol stack, which is much harder to
+change than an address. `fingerprint.hassh` is the
+[HASSH](https://github.com/salesforce/hassh) of the client's `KEXINIT`
+algorithm lists, `fingerprint.ja4` is the
+[JA4](https://github.com/FoxIO-LLC/ja4) of the TLS ClientHello on 443 (the
+sentinel terminates TLS itself so it can read the hello before the
+handshake), and `fingerprint.http` hashes the order of the request headers,
+kept verbatim in `http.header_order`. Two scanners with different addresses
+and the same HASSH are the same program. `python3 sentinel.py --selftest`
+checks the parsers against known bytes.
+
 Each connection is filed as one of:
 
 | Classification | Means |
@@ -232,7 +243,14 @@ answer onto every event from that address:
 
 The per-address answers are cached in the `address-book` index (one document
 per address, re-checked weekly), which the bootstrap also exposes as a
-Dashboards index pattern. Vector adds `threat.tool` at ingest from what the
+Dashboards index pattern. The book also records when each address was first
+seen by the sentinel and by the receiver, refreshed on every pass, and the
+enricher stamps `prior.*` onto events from it: a receiver hit gets
+`prior.sentinel_hours`, the time since that address first touched the
+sentinel, which is how "scanned first, visited later" becomes a query. A
+second index, `fingerprint-book`, holds the first sighting of every HASSH,
+JA4 and header-order hash (created once, never updated), so a fingerprint
+nobody has shown before is a new document with a fresh `@timestamp`. Vector adds `threat.tool` at ingest from what the
 client volunteered: SSH banners (`SSH-2.0-Go`, the fake `PUTTY`), user
 agents (ZGrab, CensysInspect, Nuclei, masscan, ...) and tell-tale paths
 (`/boaform/`, `/.env`). Cloudflare's own `Cf-Ipcountry` and `Cf-Ray` are
@@ -247,13 +265,17 @@ mean re-importing updates in place.
 **Alerts** go to a self-hosted [ntfy](https://ntfy.sh) server when `NTFY_URL`
 and `NTFY_TOKEN` are in `.env` (the token is a write-only ntfy access token
 for the topic; `NTFY_TOPIC` defaults to `tripwire`). The bootstrap then runs
-`alerts.py`, which creates two webhook channels and six monitors in the
+`alerts.py`, which creates two webhook channels and eight monitors in the
 Alerting plugin, all idempotent: a canary token presented back to the
 receiver, something following an embedded instruction or posting to the
 collection endpoint (tiers 2 and 3), one address touching both the
-sentinel and the receiver within an hour, two dead-man switches (no sentinel
-events for an hour, no receiver heartbeat for 30 minutes), and a low-priority
-digest at 07:00 (`DIGEST_TZ`, default Europe/Oslo). Messages are plain text,
+sentinel and the receiver within an hour, a receiver hit from an address
+that scanned the sentinel an hour or more earlier (`prior.sentinel_hours`),
+a fingerprint never seen before (a new `fingerprint-book` document), two
+dead-man switches (no sentinel events for an hour, no receiver heartbeat for
+30 minutes), and a low-priority digest at 07:00 (`DIGEST_TZ`, default
+Europe/Oslo). `python3 alerts.py --dump` prints the monitors without
+touching the cluster. Messages are plain text,
 so the attacker strings they quote can do nothing on the phone. Without the
 token the monitors are skipped and nothing else changes.
 
@@ -263,6 +285,17 @@ OpenSearch) is exercised and the digest can exclude it by user agent:
 
 ```
 */10 * * * * curl -sS -A tripwire-heartbeat -o /dev/null --max-time 20 https://<public host>/ >/dev/null 2>&1
+```
+
+`campaigns.py` groups the sentinel's addresses by what they share: the same
+HASSH, JA4 or header hash (falling back to `threat.tool`) plus the same set
+of ports. One cluster of forty addresses across six ASNs is one campaign,
+not forty scanners. Run it against the cluster with `OS_URL` and `OS_PASS`
+set:
+
+```sh
+python3 campaigns.py --days 7            # text table, biggest cluster first
+python3 campaigns.py --days 30 --json    # same, as JSON
 ```
 
 The receiver alone, without the logging stack:

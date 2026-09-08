@@ -291,7 +291,31 @@ api PUT /_index_template/tripwire "$(cat <<'EOF'
             "cf_ray":          { "type": "keyword" },
             "x_forwarded_for": { "type": "keyword", "ignore_above": 1024 },
             "header_count":    { "type": "integer" },
-            "headers_raw":     { "type": "text", "index": true }
+            "headers_raw":     { "type": "text", "index": true },
+            "header_order":    { "type": "keyword", "ignore_above": 1024 }
+          }
+        },
+
+        "fingerprint": {
+          "properties": {
+            "hassh": { "type": "keyword" },
+            "ja4":   { "type": "keyword" },
+            "http":  { "type": "keyword" }
+          }
+        },
+        "tls": {
+          "properties": {
+            "sni":     { "type": "keyword", "ignore_above": 256 },
+            "alpn":    { "type": "keyword" },
+            "version": { "type": "keyword" }
+          }
+        },
+        "ssh": { "properties": { "kex": { "type": "keyword", "ignore_above": 512 } } },
+        "prior": {
+          "properties": {
+            "sentinel_first_seen": { "type": "date" },
+            "receiver_first_seen": { "type": "date" },
+            "sentinel_hours":      { "type": "float" }
           }
         },
 
@@ -335,7 +359,7 @@ if api GET "/_cat/indices/tripwire-*?h=index" | grep -q tripwire; then
              "city_name":{"type":"keyword"},"location":{"type":"geo_point","ignore_malformed":true}}},
       "as":{"properties":{"asn":{"type":"keyword"},"organization_name":{"type":"keyword"}}},
       "domain":{"type":"keyword"}}},
-    "http":{"properties":{"cf_ipcountry":{"type":"keyword"},"cf_ray":{"type":"keyword"}}},
+    "http":{"properties":{"cf_ipcountry":{"type":"keyword"},"cf_ray":{"type":"keyword"},"header_order":{"type":"keyword"}}},
     "threat":{"properties":{"tool":{"type":"keyword"},"scanner":{"type":"keyword"},
               "lists":{"type":"keyword"},"ipsum_score":{"type":"integer"}}},
     "reputation":{"properties":{
@@ -344,6 +368,11 @@ if api GET "/_cat/indices/tripwire-*?h=index" | grep -q tripwire; then
                    "last_seen":{"type":"date","ignore_malformed":true}}},
       "abuseipdb":{"properties":{"score":{"type":"integer"},"reports":{"type":"integer"},
                    "usage_type":{"type":"keyword"},"domain":{"type":"keyword"},"is_tor":{"type":"boolean"}}}}},
+    "fingerprint":{"properties":{"hassh":{"type":"keyword"},"ja4":{"type":"keyword"},"http":{"type":"keyword"}}},
+    "tls":{"properties":{"sni":{"type":"keyword"},"alpn":{"type":"keyword"},"version":{"type":"keyword"}}},
+    "ssh":{"properties":{"kex":{"type":"keyword"}}},
+    "prior":{"properties":{"sentinel_first_seen":{"type":"date"},"receiver_first_seen":{"type":"date"},
+             "sentinel_hours":{"type":"float"}}},
     "enrichment":{"properties":{"at":{"type":"date"}}}}}' > /dev/null || true
 fi
 

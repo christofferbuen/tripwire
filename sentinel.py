@@ -603,6 +603,10 @@ def parse_client_hello(data: bytes) -> dict | None:
             break
         handshake += data[pos + 5:pos + 5 + size]
         pos += 5 + size
+        # Stop once the message is whole: a 0-RTT client follows its hello
+        # with early data records, which are not handshake and not ours.
+        if len(handshake) >= 4 and len(handshake) >= 4 + int.from_bytes(handshake[1:4], "big"):
+            break
     if len(handshake) < 4 or handshake[0] != 1:     # 1 = ClientHello
         return None
     size = int.from_bytes(handshake[1:4], "big")
