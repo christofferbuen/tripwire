@@ -244,6 +244,17 @@ Both go into the Global tenant, so every login sees them. Edit
 `dashboards.py` and re-run the bootstrap to change the panels; the fixed ids
 mean re-importing updates in place.
 
+**Alerts** go to a self-hosted [ntfy](https://ntfy.sh) server when `NTFY_URL`
+and `NTFY_TOKEN` are in `.env` (the token is a write-only ntfy access token
+for the topic; `NTFY_TOPIC` defaults to `tripwire`). The bootstrap then runs
+`alerts.py`, which creates one webhook channel and three monitors in the
+Alerting plugin, all idempotent: a canary token presented back to the
+receiver, something following an embedded instruction or posting to the
+collection endpoint (tiers 2 and 3), and one address touching both the
+sentinel and the receiver within an hour. Messages are plain text, so the
+attacker strings they quote can do nothing on the phone. Without the token
+the monitors are skipped and nothing else changes.
+
 The receiver alone, without the logging stack:
 
 ```sh

@@ -416,6 +416,15 @@ curl -sS -X POST "${DASH_URL}/api/saved_objects/_import?overwrite=true" \
   | python3 -c 'import sys, json; d = json.load(sys.stdin); print("  imported", d.get("successCount"), "objects", "" if d.get("success") else d)'
 rm -f /tmp/tripwire-dashboards.ndjson
 
+# Push alerts through ntfy. Opt-in: NTFY_URL and NTFY_TOKEN in .env, the
+# token being a write-only ntfy access token for the topic (see README).
+if [[ -n "${NTFY_TOKEN:-}" ]]; then
+  echo "Creating the alerting channel and monitors."
+  NTFY_URL="${NTFY_URL:?set NTFY_URL in .env alongside NTFY_TOKEN}"     OS_URL="$OS_URL" python3 "$(dirname "$0")/alerts.py" --test
+else
+  echo "NTFY_TOKEN not in .env, alerting skipped."
+fi
+
 echo
 echo "Verifying."
 api GET "/_index_template/tripwire?filter_path=index_templates.name" || true
