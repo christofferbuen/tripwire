@@ -31,6 +31,7 @@ import sys
 import tarfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -38,7 +39,15 @@ from datetime import datetime, timezone
 OS_URL = os.environ.get("OPENSEARCH_URL", "https://opensearch:9200")
 SECRETS_FILE = os.environ.get("SECRETS_FILE", "/run/secrets/tripwire.json")
 EVENT_INDICES = "tripwire-hits-*,tripwire-sentinel-*"
+SENTINEL_INDICES = "tripwire-sentinel-*"
 BOOK = "address-book"
+FINGERPRINT_BOOK = "fingerprint-book"
+# The three client fingerprints the sentinel records, and where Vector puts
+# them. One document per distinct value, written once: the interesting event
+# is a value nobody has ever presented here before.
+FINGERPRINT_FIELDS = {"hassh": "fingerprint.hassh",
+                      "ja4": "fingerprint.ja4",
+                      "http": "fingerprint.http"}
 CYCLE = 60                 # seconds between passes over new addresses
 RECHECK = 7 * 86400        # re-resolve and re-query an address after this long
 LIST_REFRESH = 24 * 3600   # the sources themselves update between 10 min and 1 day
@@ -111,6 +120,32 @@ def now_iso():
 
 def parse_iso(text):
     return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def hours_between(start, end):
+    """Hours from start to end, ISO 8601 with an offset (`+00:00` from the two
+    producers, `Z` from an aggregation). The painless in APPLY_SCRIPT computes
+    the same number the same way: difference in milliseconds over 3_600_000."""
+    a = datetime.fromisoformat(start.replace("Z", "+00:00"))
+    b = datetime.fromisoformat(end.replace("Z", "+00:00"))
+    return (b - a).total_seconds() / 3600.0
+
+
+def earlier(a, b):
+    """The earlier of two ISO timestamps, either of which may be missing.
+    An index the lifecycle policy has dropped takes its events' timestamps
+    with it, so the first sighting already in the book outranks a fresh
+    aggregation over what is left."""
+    if not a or not b:
+        return a or b
+    return a if hours_between(a, b) >= 0 else b
+
+
+def book_id(kind, value):
+    """Document id for the fingerprint book. The value half is attacker
+    controlled, and a raw `/` in it would make the create URL address a
+    different index, so it is percent-encoded; the separator stays literal."""
+    return kind + ":" + urllib.parse.quote(value, safe="")
 
 
 # --------------------------------------------------------------------------
@@ -344,6 +379,8 @@ BOOK_MAPPING = {
             "lists": {"type": "keyword"}, "ipsum_score": {"type": "integer"},
             "scope": {"type": "keyword"},
             "first_seen": {"type": "date"}, "checked": {"type": "date"},
+            "first_seen_sentinel": {"type": "date"},
+            "first_seen_receiver": {"type": "date"},
             "greynoise": {"properties": {
                 "noise": {"type": "boolean"}, "riot": {"type": "boolean"},
                 "classification": {"type": "keyword"}, "name": {"type": "keyword"},
@@ -356,9 +393,32 @@ BOOK_MAPPING = {
     },
 }
 
+FINGERPRINT_MAPPING = {
+    "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+    "mappings": {
+        "dynamic_templates": [{"strings_as_keyword": {
+            "match_mapping_type": "string", "mapping": {"type": "keyword", "ignore_above": 1024}}}],
+        "properties": {
+            "@timestamp": {"type": "date"}, "kind": {"type": "keyword"},
+            "value": {"type": "keyword"}, "first_ip": {"type": "keyword"},
+            "tool": {"type": "keyword"}, "ssh_client": {"type": "keyword"},
+        },
+    },
+}
+
 # Runs on every event of the address that has no enrichment yet. threat is
 # merged rather than replaced because Vector already sets threat.tool from the
 # banner or user agent at ingest.
+#
+# prior carries what the address book knows about when this address was first
+# seen by each producer. On a receiver event that also has a sentinel first
+# sighting, the gap between the two is stamped as prior.sentinel_hours: the
+# number that says "it scanned the honeypot, then N hours later it came to the
+# real site". Only a positive gap counts; scanning after the visit is the
+# ordinary direction and says nothing. params.prior is shared by every
+# document of this update-by-query, so it is copied before the hours go in.
+# ZonedDateTime.parse reads both forms written here, `+00:00` from the two
+# producers and `Z` from an aggregation. hours_between() above is the same sum.
 APPLY_SCRIPT = """
 if (ctx._source.source == null) { ctx._source.source = new HashMap(); }
 if (params.domain != null) { ctx._source.source.domain = params.domain; }
@@ -367,6 +427,20 @@ if (params.threat != null) {
   ctx._source.threat.putAll(params.threat);
 }
 if (params.reputation != null) { ctx._source.reputation = params.reputation; }
+if (params.prior != null) {
+  ctx._source.prior = new HashMap(params.prior);
+  def module = null;
+  if (ctx._source.containsKey('event') && ctx._source.event instanceof Map) {
+    module = ctx._source.event.get('module');
+  }
+  def first = params.prior.get('sentinel_first_seen');
+  def stamp = ctx._source.containsKey('@timestamp') ? ctx._source['@timestamp'] : null;
+  if ('receiver'.equals(module) && first instanceof String && stamp instanceof String) {
+    long gap = ZonedDateTime.parse(stamp).toInstant().toEpochMilli()
+             - ZonedDateTime.parse(first).toInstant().toEpochMilli();
+    if (gap > 0) { ctx._source.prior.sentinel_hours = gap / 3600000.0; }
+  }
+}
 ctx._source.enrichment = params.enrichment;
 """
 
@@ -376,13 +450,18 @@ class Enricher:
         self.os = os_client
         self.lists = lists
         self.rep = reputation
+        # ponytail: unbounded set of fingerprint ids, one short string each.
+        # A honeypot sees thousands of distinct stacks, not millions; give it
+        # an LRU or a periodic reload from the book if that stops being true.
+        self.known_fingerprints = set()
 
     def ensure_book(self):
-        status, doc = self.os.call("PUT", "/" + BOOK, BOOK_MAPPING)
-        if status == 200:
-            log.info("created index %s", BOOK)
-        elif status != 400 or "already_exists" not in json.dumps(doc):
-            raise RuntimeError(f"cannot create {BOOK}: {status} {doc}")
+        for name, mapping in ((BOOK, BOOK_MAPPING), (FINGERPRINT_BOOK, FINGERPRINT_MAPPING)):
+            status, doc = self.os.call("PUT", "/" + name, mapping)
+            if status == 200:
+                log.info("created index %s", name)
+            elif status != 400 or "already_exists" not in json.dumps(doc):
+                raise RuntimeError(f"cannot create {name}: {status} {doc}")
 
     def pending(self):
         body = {"size": 0,
@@ -395,17 +474,45 @@ class Enricher:
             return []
         return [b["key"] for b in doc.get("aggregations", {}).get("ips", {}).get("buckets", [])]
 
+    def first_seen(self, ip_text):
+        """Earliest event of this address per producer. One cheap aggregation
+        with no lookback, so it runs on every pass: an address that scanned the
+        sentinel months ago and shows up on the site today has to be caught the
+        moment it does, not whenever its cache entry next expires."""
+        body = {"size": 0,
+                "query": {"bool": {"filter": [{"term": {"source.ip": ip_text}}]}},
+                "aggs": {"modules": {"terms": {"field": "event.module", "size": 5},
+                                     "aggs": {"first": {"min": {"field": "@timestamp"}}}}}}
+        status, doc = self.os.call("POST", f"/{EVENT_INDICES}/_search?ignore_unavailable=true", body)
+        if status != 200:
+            log.warning("first-seen %s: %s %s", ip_text, status, doc)
+            return {}
+        out = {}
+        for bucket in doc.get("aggregations", {}).get("modules", {}).get("buckets", []):
+            stamp = bucket.get("first", {}).get("value_as_string")
+            if stamp and bucket["key"] in ("sentinel", "receiver"):
+                out["first_seen_" + bucket["key"]] = stamp
+        return out
+
     def lookup(self, ip_text):
         status, doc = self.os.call("GET", f"/{BOOK}/_doc/{ip_text}")
         cached = doc.get("_source") if status == 200 else None
+        found, book = self.first_seen(ip_text), cached or {}
+        seen = {k: earlier(found.get(k), book.get(k))
+                for k in ("first_seen_sentinel", "first_seen_receiver")
+                if found.get(k) or book.get(k)}
         if cached and (datetime.now(timezone.utc) - parse_iso(cached["checked"])).total_seconds() < RECHECK:
+            fresh = {k: v for k, v in seen.items() if cached.get(k) != v}
+            if fresh:
+                cached.update(fresh)
+                self.os.call("POST", f"/{BOOK}/_update/{ip_text}", {"doc": fresh})
             return cached
         try:
             ip = ipaddress.ip_address(ip_text)
         except ValueError:
             return None
         entry = {"ip": ip_text, "checked": now_iso(),
-                 "first_seen": (cached or {}).get("first_seen") or now_iso()}
+                 "first_seen": (cached or {}).get("first_seen") or now_iso(), **seen}
         if ip.is_global:
             ptr = reverse_dns(ip_text)
             scanner, lists, score = self.lists.match(ip)
@@ -432,8 +539,11 @@ class Enricher:
     def apply(self, entry):
         threat = {k: entry[k] for k in ("scanner", "lists", "ipsum_score") if entry.get(k) is not None}
         reputation = {k: entry[k] for k in ("greynoise", "abuseipdb") if entry.get(k)}
+        prior = {f"{who}_first_seen": entry[f"first_seen_{who}"]
+                 for who in ("sentinel", "receiver") if entry.get(f"first_seen_{who}")}
         params = {"domain": entry.get("ptr"), "threat": threat or None,
-                  "reputation": reputation or None, "enrichment": {"at": now_iso()}}
+                  "reputation": reputation or None, "prior": prior or None,
+                  "enrichment": {"at": now_iso()}}
         body = {"query": {"bool": {"filter": [{"term": {"source.ip": entry["ip"]}},
                                               {"range": {"@timestamp": {"gte": LOOKBACK}}}],
                                    "must_not": [{"exists": {"field": "enrichment.at"}}]}},
@@ -444,7 +554,51 @@ class Enricher:
             log.warning("apply %s: %s %s", entry["ip"], status, doc)
         return doc.get("updated", 0)
 
+    def fingerprints(self):
+        """Fill the fingerprint book from the sentinel indices. Every document
+        is written with _create, so the first sighting is never overwritten and
+        @timestamp keeps meaning "the first time this stack knocked"."""
+        for kind, field in FINGERPRINT_FIELDS.items():
+            body = {"size": 0,
+                    "query": {"bool": {"filter": [{"exists": {"field": field}}]}},
+                    "aggs": {"values": {
+                        "terms": {"field": field, "size": 1000},
+                        "aggs": {"first": {"min": {"field": "@timestamp"}},
+                                 "earliest": {"top_hits": {
+                                     "size": 1, "sort": [{"@timestamp": "asc"}],
+                                     "_source": ["source.ip", "threat.tool", "ssh_client"]}}}}}}
+            status, doc = self.os.call(
+                "POST", f"/{SENTINEL_INDICES}/_search?ignore_unavailable=true", body)
+            if status != 200:
+                log.warning("fingerprints %s: %s %s", kind, status, doc)
+                continue
+            for bucket in doc.get("aggregations", {}).get("values", {}).get("buckets", []):
+                doc_id = book_id(kind, bucket["key"])
+                if doc_id in self.known_fingerprints:
+                    continue
+                hits = bucket.get("earliest", {}).get("hits", {}).get("hits", [])
+                src = hits[0].get("_source", {}) if hits else {}
+                entry = {"@timestamp": bucket.get("first", {}).get("value_as_string"),
+                         "kind": kind, "value": bucket["key"]}
+                first_ip = (src.get("source") or {}).get("ip")
+                for key, value in (("first_ip", first_ip),
+                                   ("tool", (src.get("threat") or {}).get("tool")),
+                                   ("ssh_client", src.get("ssh_client"))):
+                    if value:
+                        entry[key] = value
+                status, resp = self.os.call(
+                    "PUT", f"/{FINGERPRINT_BOOK}/_create/{doc_id}", entry)
+                if status in (200, 201):
+                    log.info("new fingerprint %s %s from %s", kind, bucket["key"], first_ip)
+                elif status == 409:  # the normal case: seen on an earlier pass
+                    log.debug("fingerprint %s already in the book", doc_id)
+                else:
+                    log.warning("fingerprint %s: %s %s", doc_id, status, resp)
+                    continue
+                self.known_fingerprints.add(doc_id)
+
     def cycle(self):
+        self.fingerprints()
         ips = self.pending()
         if not ips:
             return
@@ -500,6 +654,35 @@ def selftest():
     assert scanner_from_ptr("shadowserver.org.example.net") is None
     assert scanner_from_ptr(None) is None
     assert not ipaddress.ip_address("10.89.0.4").is_global
+
+    # The gap the painless stamps as prior.sentinel_hours. Both writers emit
+    # the +00:00 form; an aggregation hands back the Z form; the two mix,
+    # because the book's dates come from aggregations and the event's from
+    # the producer.
+    assert hours_between("2026-09-01T00:00:00+00:00", "2026-09-01T06:30:00+00:00") == 6.5
+    assert hours_between("2026-09-01T00:00:00.000Z", "2026-09-01T01:00:00+00:00") == 1.0
+    assert hours_between("2026-09-01T12:00:00Z", "2026-09-01T09:00:00+00:00") == -3.0
+    # The sentinel visited first: positive, so it is stored. Reversed it is
+    # negative and the painless drops it.
+    assert hours_between("2026-09-01T00:00:00+00:00", "2026-09-04T00:00:00+00:00") == 72.0
+
+    # first_seen merging keeps the earlier date whichever side it comes from,
+    # and tolerates a missing side.
+    assert earlier("2026-09-01T00:00:00Z", "2026-08-01T00:00:00Z") == "2026-08-01T00:00:00Z"
+    assert earlier("2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z") == "2026-08-01T00:00:00Z"
+    assert earlier(None, "2026-09-01T00:00:00Z") == "2026-09-01T00:00:00Z"
+    assert earlier("2026-09-01T00:00:00Z", None) == "2026-09-01T00:00:00Z"
+    assert earlier(None, None) is None
+
+    # Fingerprint ids: the value half is attacker text, so a slash cannot be
+    # allowed to walk out of the index in the create URL.
+    assert book_id("hassh", "06046964c022c6407d15a27b12a6a4fb") == \
+        "hassh:06046964c022c6407d15a27b12a6a4fb"
+    assert book_id("ja4", "t13d1516h2_8daaf6152771_b186095e22b6") == \
+        "ja4:t13d1516h2_8daaf6152771_b186095e22b6"
+    assert book_id("http", "a/b:c d") == "http:a%2Fb%3Ac%20d"
+    assert "/" not in book_id("http", "../../_all")
+
     print("selftest ok")
 
 

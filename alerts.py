@@ -14,6 +14,13 @@ look, one low priority for the daily digest.
                              posted to the collection endpoint (tiers 2 and 3)
   tripwire-both              one address touched the sentinel and the receiver
                              within an hour: scanned first, then knocked
+  tripwire-returned          a receiver hit from an address whose first
+                             sentinel contact is at least an hour older. The
+                             same shape as tripwire-both over any distance in
+                             time: it scanned the honeypot, then came back to
+                             the real site days or weeks later
+  tripwire-novel-fingerprint a client stack (HASSH, JA4 or header order) the
+                             sentinel has never seen before
   tripwire-sentinel-silent   no sentinel events for an hour. It sees dozens
                              of connections an hour at its quietest, so an
                              empty hour means the VM, its Vector or WireGuard
@@ -165,6 +172,7 @@ DIGEST_MESSAGE = (
 
 HITS = ["tripwire-hits-*"]
 SENTINEL = ["tripwire-sentinel-*"]
+FINGERPRINTS = ["fingerprint-book"]
 
 MONITORS = [
     query_monitor(
@@ -217,6 +225,32 @@ MONITORS = [
         "Receiver heartbeat missing for 30 minutes: three fetches of the "
         "public site failed to arrive. Receiver, its Vector or the tunnel "
         "is down."),
+    # prior.sentinel_hours is stamped by the enricher on receiver events only,
+    # and only when the sentinel saw the address first; the gte 1 keeps out the
+    # same-visit noise tripwire-both already covers.
+    query_monitor(
+        "tripwire-returned", HITS,
+        [{"range": {"prior.sentinel_hours": {"gte": 1}}}],
+        "returned to the site", "2",
+        "Scanned the sentinel first, came to the site later.\n"
+        "{{#ctx.results.0.hits.hits}}"
+        "{{_source.source.ip}} {{_source.source.geo.country_iso_code}} "
+        "{{_source.tier_name}} {{_source.method}} {{_source.path}}, "
+        "{{_source.prior.sentinel_hours}} h after first sentinel contact\n"
+        "{{/ctx.results.0.hits.hits}}"),
+    # Every document in the book is a first sighting, and its @timestamp is
+    # when that sighting happened, so the window filter alone is the novelty
+    # test: a fingerprint indexed today for a stack first seen last month
+    # stays quiet, which is what it should do.
+    query_monitor(
+        "tripwire-novel-fingerprint", FINGERPRINTS, [],
+        "fingerprint not seen before", "3",
+        "New client fingerprint.\n"
+        "{{#ctx.results.0.hits.hits}}"
+        "{{_source.kind}} {{_source.value}} {{_source.first_ip}} "
+        "{{_source.tool}} {{_source.ssh_client}}\n"
+        "{{/ctx.results.0.hits.hits}}",
+        throttle_minutes=5),
     query_monitor(
         "tripwire-digest", HITS + SENTINEL, [], "daily", "5", DIGEST_MESSAGE,
         minutes=24 * 60, size=0, condition="true", throttle_minutes=0,
@@ -278,6 +312,11 @@ def test_channel():
 
 
 if __name__ == "__main__":
+    if "--dump" in sys.argv:
+        # Everything above is a literal; printing it needs no cluster, so the
+        # monitor definitions can be read and diffed away from the deployment.
+        print(json.dumps(MONITORS, indent=2))
+        sys.exit(0)
     channel(CHANNEL_ID, "Tripwire", "high", "honeypot")
     channel(DIGEST_CHANNEL_ID, "Tripwire digest", "low", "bar_chart")
     monitors()
