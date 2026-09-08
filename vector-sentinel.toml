@@ -96,7 +96,9 @@ inputs = ["sentinel_events"]
 endpoints = ["SECRET[local.opensearch_endpoint]"]
 api_version = "v7"
 mode = "bulk"
-bulk.index = "tripwire-sentinel-%Y.%m.%d"
+# The write alias, not a dated name. bootstrap-opensearch.sh creates it and
+# ISM rolls it daily; the sentinel-writer role cannot create indices itself.
+bulk.index = "tripwire-sentinel"
 auth.strategy = "basic"
 auth.user = "sentinel-writer"
 auth.password = "SECRET[local.opensearch_password]"

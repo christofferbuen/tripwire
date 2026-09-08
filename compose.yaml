@@ -121,6 +121,9 @@ services:
     container_name: tripwire-opensearch
     environment:
       discovery.type: single-node
+      # Off by default on single-node clusters, which turns the disk
+      # watermarks bootstrap-opensearch.sh sets into no-ops.
+      cluster.routing.allocation.disk.watermark.enable_for_single_data_node: "true"
       bootstrap.memory_lock: "true"
       OPENSEARCH_JAVA_OPTS: -Xms1g -Xmx1g
       # The security plugin stays on. It is what stops anything that reaches
