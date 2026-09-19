@@ -120,6 +120,7 @@ services:
       - ./vector-sentinel.toml:/etc/vector/vector.toml:ro,Z
       - ./sentinel-secrets.json:/etc/vector/secrets.json:ro,Z
       - sentinel-logs:/var/log/sentinel:ro,Z
+      - /var/log/tripwire-egress:/var/log/tripwire-egress:ro
       - vector-data:/var/lib/vector:Z
     read_only: true
     cap_drop:
