@@ -31,7 +31,14 @@ path = "/etc/vector/secrets.json"
 
 [sources.sentinel]
 type = "file"
-include = ["/var/log/sentinel/connections.jsonl"]
+# Package D's egress watcher writes its own JSONL under a different
+# directory; folding it into this source keeps one shipper on this host. A
+# path in `include` that does not exist yet is not an error for a file
+# source, so this ships fine ahead of D landing on a given VM.
+include = [
+  "/var/log/sentinel/connections.jsonl",
+  "/var/log/tripwire-egress/egress.jsonl",
+]
 read_from = "beginning"
 fingerprint.strategy = "checksum"
 fingerprint.lines = 1
@@ -87,6 +94,29 @@ if exists(.http_header_order) { .http.header_order = del(.http_header_order) }
 # it flat, and the banner is a claim rather than a measurement.
 if exists(.ssh_kex_client) { .ssh.kex = del(.ssh_kex_client) }
 
+# Wave 1 fields: A1's network/SMTP/HTTP additions, A2's STARTTLS and bait
+# fields, D's egress summaries. Moved now so this file does not need
+# reopening later; an absent field costs nothing. proto_mismatch stays flat
+# (it is not nested anywhere), so there is no move line for it.
+if exists(.tcp_rtt_ms) { .network.rtt_ms = del(.tcp_rtt_ms) }
+if exists(.tcp_rttvar_ms) { .network.rttvar_ms = del(.tcp_rttvar_ms) }
+if exists(.tcp_mss) { .network.mss = del(.tcp_mss) }
+if exists(.smtp_helo) { .smtp.helo = del(.smtp_helo) }
+if exists(.smtp_mail_from) { .smtp.mail_from = del(.smtp_mail_from) }
+if exists(.smtp_rcpt) { .smtp.rcpt = del(.smtp_rcpt) }
+if exists(.smtp_auth_user) { .smtp.auth_user = del(.smtp_auth_user) }
+if exists(.smtp_auth_pass) { .smtp.auth_pass = del(.smtp_auth_pass) }
+if exists(.smtp_starttls) { .smtp.starttls = del(.smtp_starttls) }
+if exists(.http_host_foreign) { .http.host_foreign = del(.http_host_foreign) }
+if exists(.bait_served) { .bait.served = del(.bait_served) }
+if exists(.bait_credential_used) { .bait.credential_used = del(.bait_credential_used) }
+if exists(.egress_dst_ip) { .egress.dst_ip = del(.egress_dst_ip) }
+if exists(.egress_dst_port) { .egress.dst_port = del(.egress_dst_port) }
+if exists(.egress_proto) { .egress.proto = del(.egress_proto) }
+if exists(.egress_uid) { .egress.uid = del(.egress_uid) }
+if exists(.egress_scope) { .egress.scope = del(.egress_scope) }
+if exists(.egress_count) { .egress.count = del(.egress_count) }
+
 # Which tool this looks like, from what the client volunteered. The SSH
 # banner is the most honest signal: Go's ssh library announces itself as
 # exactly "SSH-2.0-Go", and the "PUTTY" spelling is a brute-forcer imitating
@@ -132,6 +162,47 @@ tool = if ssh == "SSH-2.0-Go" { "go-ssh"
 } else { null }
 if tool != null { .threat = { "tool": tool } }
 
+# Named exploit signatures in what the client actually sent. http_requests
+# and http_body are attacker-controlled and may arrive as any JSON type; the
+# array()/string() assertions plus ?? turn a wrong type into "absent" rather
+# than a dropped event. `paths` above is already the lowercased join of
+# http_requests, so it is reused rather than rebuilt. The table is
+# duplicated in vector.toml; keep them in step. Placed after the line that
+# sets .threat, since that line replaces the object rather than merging.
+hay = paths + " " + downcase(string(.http_body) ?? "")
+names = []
+if contains(hay, "/sdk/weblanguage") { names = push(names, "hikvision-cve-2021-36260") }
+if contains(hay, "/boaform/admin/formlogin") { names = push(names, "boa-formlogin") }
+if contains(hay, "/cgi-bin/luci/;stok=/locale") { names = push(names, "tplink-cve-2023-1389") }
+if contains(hay, "/gponform/diag_form") { names = push(names, "gpon-cve-2018-10561") }
+if contains(hay, "/hnap1") { names = push(names, "dlink-hnap") }
+if contains(hay, "setup.cgi?next_file=netgear.cfg") { names = push(names, "netgear-dgn-setup-cgi") }
+if contains(hay, "eval-stdin.php") { names = push(names, "phpunit-cve-2017-9841") }
+if contains(hay, "/actuator/gateway/routes") { names = push(names, "spring-gateway-cve-2022-22947") }
+if contains(hay, "/cgi-bin/.%2e/") { names = push(names, "apache-cve-2021-41773") }
+if contains(hay, "/_ignition/execute-solution") { names = push(names, "laravel-ignition-cve-2021-3129") }
+if contains(hay, "${jndi:") { names = push(names, "log4shell-cve-2021-44228") }
+if contains(hay, "/autodiscover/autodiscover.json") { names = push(names, "exchange-proxyshell") }
+if contains(hay, "/mgmt/tm/util/bash") { names = push(names, "f5-cve-2022-1388") }
+if contains(hay, "/ws/v1/cluster/apps/new-application") { names = push(names, "hadoop-yarn-rce") }
+if contains(hay, "/device.rsp?opt=sys&cmd=") { names = push(names, "tbk-dvr-cve-2024-3721") }
+if contains(hay, "/shell?cd+/tmp") { names = push(names, "jaws-webserver-rce") }
+if length(names) > 0 { .threat.exploit = names }
+
+# CONNECT and absolute-URI request lines are a proxy abuse probe. The method
+# is case-sensitive, as HTTP is, so this walks the raw request lines rather
+# than the lowercased haystack above. The receiver sits behind a CDN that
+# never forwards a request shaped like this, so vector.toml does not get
+# this field.
+proxy = false
+for_each(array(.http_requests) ?? []) -> |_i, v| {
+  line = string(v) ?? ""
+  if starts_with(line, "CONNECT ") || match(line, r'^[A-Z]+ https?://') {
+    proxy = true
+  }
+}
+if proxy { .threat.proxy_probe = true }
+
 # A connection that completed the handshake and then said nothing is a
 # scanner confirming the port is open. One that spoke the protocol is trying
 # to use the service. One that spoke while we had already decided it was
@@ -139,14 +210,17 @@ if tool != null { .threat = { "tool": tool } }
 #
 # Not every line is a connection. The sentinel also emits a one-off summary
 # when an address first crosses the sweep threshold, and a marker when it
-# sheds a connection at capacity. Neither carries a port, so both have to be
-# taken out before the spoke/sweeping test, or they get filed as a scanner
+# sheds a connection at capacity, and package D's egress watcher emits a
+# summary with kind "egress" and no port at all. All three have to be taken
+# out before the spoke/sweeping test, or they get filed as a scanner
 # confirming a port that is not in the record.
 kind = string(.kind) ?? "connect"
 outcome = string(.outcome) ?? ""
 spoke = bool(.spoke) ?? false
 sweeping = bool(.sweeping) ?? false
-.classification = if kind == "sweep" {
+.classification = if kind == "egress" {
+  "egress-blocked"
+} else if kind == "sweep" {
   "sweep-detected"
 } else if outcome == "shed-load" {
   "shed-load"

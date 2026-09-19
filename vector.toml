@@ -167,6 +167,35 @@ tool = if contains(ua, "zgrab") { "zgrab"
 } else if contains(path, "wp-") || contains(path, "xmlrpc.php") { "wordpress-probe"
 } else { null }
 if tool != null { .threat = { "tool": tool } }
+
+# Named exploit signatures in the path and posted body. `path` above is
+# already the lowercased request path, so it is reused rather than rebuilt.
+# body_excerpt is attacker-controlled and may arrive as any JSON type; the
+# string() assertion plus ?? turns a wrong type into "absent" rather than a
+# dropped event. The table is duplicated in vector-sentinel.toml; keep them
+# in step. Placed after the line that sets .threat, since that line replaces
+# the object rather than merging. The receiver sits behind a CDN that never
+# forwards a CONNECT or absolute-URI request, so this file has no
+# threat.proxy_probe.
+hay = path + " " + downcase(string(.body_excerpt) ?? "")
+names = []
+if contains(hay, "/sdk/weblanguage") { names = push(names, "hikvision-cve-2021-36260") }
+if contains(hay, "/boaform/admin/formlogin") { names = push(names, "boa-formlogin") }
+if contains(hay, "/cgi-bin/luci/;stok=/locale") { names = push(names, "tplink-cve-2023-1389") }
+if contains(hay, "/gponform/diag_form") { names = push(names, "gpon-cve-2018-10561") }
+if contains(hay, "/hnap1") { names = push(names, "dlink-hnap") }
+if contains(hay, "setup.cgi?next_file=netgear.cfg") { names = push(names, "netgear-dgn-setup-cgi") }
+if contains(hay, "eval-stdin.php") { names = push(names, "phpunit-cve-2017-9841") }
+if contains(hay, "/actuator/gateway/routes") { names = push(names, "spring-gateway-cve-2022-22947") }
+if contains(hay, "/cgi-bin/.%2e/") { names = push(names, "apache-cve-2021-41773") }
+if contains(hay, "/_ignition/execute-solution") { names = push(names, "laravel-ignition-cve-2021-3129") }
+if contains(hay, "${jndi:") { names = push(names, "log4shell-cve-2021-44228") }
+if contains(hay, "/autodiscover/autodiscover.json") { names = push(names, "exchange-proxyshell") }
+if contains(hay, "/mgmt/tm/util/bash") { names = push(names, "f5-cve-2022-1388") }
+if contains(hay, "/ws/v1/cluster/apps/new-application") { names = push(names, "hadoop-yarn-rce") }
+if contains(hay, "/device.rsp?opt=sys&cmd=") { names = push(names, "tbk-dvr-cve-2024-3721") }
+if contains(hay, "/shell?cd+/tmp") { names = push(names, "jaws-webserver-rce") }
+if length(names) > 0 { .threat.exploit = names }
 '''
 
 # --------------------------------------------------------------------------

