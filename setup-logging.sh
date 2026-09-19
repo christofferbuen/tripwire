@@ -78,9 +78,23 @@ secrets = {"opensearch_password": password}
 # Optional. enrich.py asks GreyNoise and AbuseIPDB about each address when
 # these are present in .env and skips them when they are not.
 for env_key, out_key in (("GREYNOISE_API_KEY", "greynoise_api_key"),
-                         ("ABUSEIPDB_API_KEY", "abuseipdb_api_key")):
+                         ("ABUSEIPDB_API_KEY", "abuseipdb_api_key"),
+                         ("OTX_API_KEY", "otx_api_key"),
+                         ("SENTINEL_PUBLIC_IP", "sentinel_public_ip")):
     if env.get(env_key):
         secrets[out_key] = env[env_key]
+# internetdb, dshield, otx: each is off unless named here. They send
+# attacker addresses to third parties, so opting in is a line in .env.
+if env.get("ENRICH_LOOKUPS"):
+    secrets["lookups"] = [s.strip() for s in env["ENRICH_LOOKUPS"].split(",") if s.strip()]
+# Sentinel's own coordinates, for the RTT-against-geography verdict. Without
+# both, enrich.py skips that feature and says so once at start-up.
+for env_key, out_key in (("SENTINEL_LAT", "sentinel_lat"), ("SENTINEL_LON", "sentinel_lon")):
+    if env.get(env_key):
+        try:
+            secrets[out_key] = float(env[env_key])
+        except ValueError:
+            sys.exit(f"{env_key} in {env_path} is not a number: {env[env_key]!r}")
 with open(out_path, "w", encoding="utf-8") as fh:
     json.dump(secrets, fh)
 PY
