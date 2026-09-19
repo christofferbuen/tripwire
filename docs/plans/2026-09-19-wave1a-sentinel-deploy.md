@@ -11,6 +11,22 @@ Code: `main` at or after "Keep every value in the secrets file a string",
 full suite green. The collector already runs it, so every field the new
 sentinel sends has a mapping waiting.
 
+## Two accounts
+
+The admin login and the owner of the stack need not be the same account.
+Where the alias logs in as an administrator and the rootless stack belongs
+to a service user, every `podman` command below runs as that user, with
+the runtime directory set, because `su` does not start a login session:
+
+```bash
+asu() { su - <owner> -c "export XDG_RUNTIME_DIR=/run/user/$(id -u <owner>); cd ~/tripwire; $1" < /dev/null; }
+asu "podman ps"
+```
+
+`~/tripwire` below means the owner's directory, `sudo` in step 4 falls
+away, and files arrive through `/tmp` (step 5). Volume names carry the
+compose project prefix (`tripwire_sentinel-logs`).
+
 ## What goes to the VM
 
 | file | change |
@@ -125,7 +141,7 @@ VM: `cd ~/tripwire && sha256sum sentinel.py vector-sentinel.toml compose.sentine
 Any mismatch is an edit made on the host (or a deploy older than
 `da9c980`: try the hash of the commit before). Stop, `diff`, carry the edit
 into the repo or decide to drop it. `compose.sentinel.yaml` is the likely
-one. A changed `sentinel.py` also makes the "before" capture of step 3 a
+one (a difference in comments only is dropped by shipping `main`'s copy). A changed `sentinel.py` also makes the "before" capture of step 3 a
 capture of something the repo does not know.
 
 ### 3. Capture "before"
@@ -169,6 +185,21 @@ scp sentinel.py vector-sentinel.toml compose.sentinel.yaml <sentinel>:tripwire/
 cd ~/tripwire && sed -i 's/\r$//' sentinel.py vector-sentinel.toml compose.sentinel.yaml
 sha256sum sentinel.py vector-sentinel.toml compose.sentinel.yaml
 ```
+
+With a separate admin login, copy to `/tmp` instead, strip the line endings
+there, and place the files with their owner and mode in one go:
+
+```bash
+# workstation
+scp sentinel.py vector-sentinel.toml compose.sentinel.yaml <sentinel>:/tmp/
+# VM, as the administrator
+cd /tmp && sed -i 's/\r$//' sentinel.py vector-sentinel.toml compose.sentinel.yaml
+install -o <owner> -g <owner> -m 0644 sentinel.py vector-sentinel.toml compose.sentinel.yaml ~<owner>/tripwire/
+rm /tmp/sentinel.py /tmp/vector-sentinel.toml /tmp/compose.sentinel.yaml
+```
+
+`install` writes a new inode just as `sed -i` does, so the running Vector
+still reads the old config until step 7.
 
 Compare with `git show main:$f | tr -d '\r' | sha256sum` at the
 workstation. Every line must agree: that is what lets the VM trust the
@@ -251,7 +282,7 @@ needs an address with a GeoIP position, so give it an hour.
   longer stuck at zero.
 - After a quiet day: remove `../tripwire-backup-wave1a` on both hosts and
   `podman rmi localhost/sentinel:pre-wave1a` on the VM; delete
-  `before.txt` / `after.txt`; delete the six merged branches.
+  `before.txt` / `after.txt`.
 - `tripwire-egress` still cannot fire. That waits for D, which waits for
   the admin-path decision.
 
