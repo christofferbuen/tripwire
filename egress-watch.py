@@ -119,6 +119,41 @@ class Window:
         return ready
 
 
+class LineBuffer:
+    """Split a raw byte stream into lines.
+
+    The pipe has to be read raw. `select()` reports a descriptor ready, but
+    a buffered `readline()` pulls whatever else has arrived into Python's
+    own buffer and hands back one line; `select()` then calls the descriptor
+    quiet while the rest of the burst is sitting in userspace. On a host
+    being scanned the burst is the interesting part.
+
+    The tail cap is the hostile half. Once the VM is owned, something can
+    write to the journal without ever writing a newline, so an unterminated
+    tail past MAX_LINE is dropped along with everything up to the next
+    newline rather than grown.
+    """
+
+    def __init__(self, max_line: int = MAX_LINE) -> None:
+        self.max_line = max_line
+        self.tail = b""
+        self.skipping = False
+
+    def feed(self, chunk: bytes) -> list[str]:
+        parts = (self.tail + chunk).split(b"\n")
+        self.tail = parts.pop()
+        lines = []
+        for part in parts:
+            if self.skipping:          # the remainder of an over-long line
+                self.skipping = False
+                continue
+            lines.append(part.decode("utf-8", "replace"))
+        if len(self.tail) > self.max_line:
+            self.tail = b""
+            self.skipping = True
+        return lines
+
+
 class Out:
     """Append JSONL for Vector to tail.
 
@@ -147,25 +182,29 @@ def follow(args) -> int:
 
     window = Window(args.window)
     out = Out(args.out)
+    buffer = LineBuffer()
+    # Binary and unbuffered: see LineBuffer for why readline() loses bursts.
     proc = subprocess.Popen(JOURNAL, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, text=True,
-                            errors="replace", bufsize=1)
+                            stderr=subprocess.DEVNULL, bufsize=0)
+    fd = proc.stdout.fileno()
     try:
         while True:
             if proc.poll() is not None:
                 print("egress-watch: journalctl exited", file=sys.stderr)
                 return 1
             # A one-second wait rather than a blocking read, so a window
-            # still closes on a quiet host. The kernel writes whole lines,
-            # so readline() after a ready fd does not block in practice.
-            ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+            # still closes on a quiet host.
+            ready, _, _ = select.select([fd], [], [], 1.0)
             if ready:
-                line = proc.stdout.readline()
-                if not line:
-                    continue
-                event = parse_line(line.rstrip("\n"))
-                if event is not None:
-                    window.add(event, time.monotonic())
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    print("egress-watch: journalctl closed its pipe",
+                          file=sys.stderr)
+                    return 1
+                for line in buffer.feed(chunk):
+                    event = parse_line(line)
+                    if event is not None:
+                        window.add(event, time.monotonic())
             for finished in window.due(time.monotonic()):
                 out.write(finished)
     except KeyboardInterrupt:
@@ -236,6 +275,27 @@ def selftest() -> int:
     window.add(parse_line(CONTAINER), 0.0)
     window.add(parse_line(ICMP), 0.0)
     assert len(window.due(61.0)) == 2
+
+    # A burst arrives as one read, not as one line per select().
+    burst = LineBuffer()
+    chunk = (CONTAINER + "\n").encode() * 30
+    got = burst.feed(chunk)
+    assert len(got) == 30, len(got)
+    assert all(parse_line(line) is not None for line in got)
+    assert burst.tail == b""
+
+    # A line cut in half by the pipe is one line, once the rest arrives.
+    split = LineBuffer()
+    half = CONTAINER[:40].encode()
+    assert split.feed(half) == []
+    assert split.feed(CONTAINER[40:].encode() + b"\n") == [CONTAINER]
+
+    # Something writing without newlines does not grow the buffer, and the
+    # remains of the over-long line do not become an event of their own.
+    hostile = LineBuffer()
+    assert hostile.feed(b"A" * 5000) == []
+    assert len(hostile.tail) <= MAX_LINE
+    assert hostile.feed(b"\n" + CONTAINER.encode() + b"\n") == [CONTAINER]
 
     print("selftest ok")
     return 0

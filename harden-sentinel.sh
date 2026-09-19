@@ -31,6 +31,19 @@
 # rules accept what the stack answers today. An OS-detection scan must read
 # the same before and after, or the deception is worse off than it started.
 #
+# Two consequences only the VM itself can show you, both deliberate:
+#
+#   - aardvark-dns and pasta run as the podman user, so a container
+#     resolving a NAME is a container uid sending to port 53, and is dropped
+#     and logged like any other attempt. vector-sentinel.toml reaches the
+#     collector by address, which is why this stays quiet; put a hostname in
+#     it and every lookup becomes an egress event.
+#   - an administrator whose uid is >= 1000 and who is not the podman user
+#     falls into the catch-all: their own curl, git or apt is dropped and
+#     logged as tripwire-egress-other. That is the intent -- this is a
+#     sensor, not a workstation -- but it is worth knowing before the first
+#     "why is my curl hanging".
+#
 # Site values live in /etc/tripwire/harden.env (root, 0600), never here:
 #
 #   ADMIN_PORT           port the real sshd already listens on; never changed
@@ -80,6 +93,7 @@ EGRESS_UNIT=/etc/systemd/system/tripwire-egress-watch.service
 LLM_SERVICE=/etc/systemd/system/tripwire-llm-set.service
 LLM_TIMER=/etc/systemd/system/tripwire-llm-set.timer
 EGRESS_DIR=/var/log/tripwire-egress
+WG_DIR=/etc/wireguard
 ROLLBACK_UNIT=tripwire-harden-rollback
 WINDOW_UNIT=tripwire-build-window
 LOG_RATE="30/minute"        # kernel log lines per prefix, per minute
@@ -192,6 +206,15 @@ derive() {
   if [[ "$COLLECTOR_WG" == *:* ]]; then WG_FAM=ip6; WG_BITS=128; else WG_FAM=ip; WG_BITS=32; fi
   if [[ "$COLLECTOR_ENDPOINT" == *:* ]]; then EP_FAM=ip6; else EP_FAM=ip; fi
 
+  # The env names OUR listen port, which is the source port of everything
+  # wg sends. The peer's port, which would be the destination, has no key,
+  # so the outbound rule is narrowed on the half that is actually known.
+  if [[ -n "$WG_LISTEN_PORT" ]]; then
+    WG_SPORT=" udp sport ${WG_LISTEN_PORT}"
+  else
+    WG_SPORT=" meta l4proto udp"
+  fi
+
   SKUIDS="$PODMAN_UID, $SUBUID_RANGE"
   FAKE_SKUIDS=""
   if [[ -n "$FAKEVM_UID" ]]; then
@@ -223,7 +246,7 @@ managed_paths() {
 # Also snapshotted, because --confirm and --apply edit them in place.
 snapshot_paths() {
   managed_paths
-  printf '%s\n' "$NFT_MAIN" "/etc/wireguard/${WG_IFACE}.conf"
+  printf '%s\n' "$NFT_MAIN" "${WG_DIR}/${WG_IFACE}.conf"
 }
 
 # --- rendering -----------------------------------------------------------
@@ -347,10 +370,6 @@ NFT
     ct state established,related accept
     oif lo accept
 
-    # The tunnel. Kernel-generated packets carry no socket owner, so this
-    # rule matches by address and never by uid.
-    ${EP_FAM} daddr ${COLLECTOR_ENDPOINT} meta l4proto udp accept
-
     # Vector shipping to the collector, inside the tunnel. Rootless podman
     # moves container traffic through the user's own network helper, so it
     # arrives here carrying the podman user's uid.
@@ -384,6 +403,13 @@ NFT
     meta skuid { ${SKUIDS} } ct state new limit rate ${LOG_RATE} log prefix "tripwire-egress " flags skuid
     meta skuid { ${SKUIDS} } counter drop
 
+    # The tunnel, deliberately BELOW the container rules. WireGuard
+    # encapsulation is built in the kernel and carries no socket owner, so
+    # it never matched them and arrives here regardless; a container uid,
+    # on the other hand, was already dropped above and so cannot use the
+    # collector's public address as a way out on an arbitrary UDP port.
+    ${EP_FAM} daddr ${COLLECTOR_ENDPOINT}${WG_SPORT} accept
+
     # System services: resolver, time, apt, certificate renewal later.
     meta skuid 0-999 udp dport { 53, 123 } accept
     meta skuid 0-999 tcp dport { 53, 80, 443 } accept
@@ -391,7 +417,11 @@ NFT
     meta l4proto icmp accept
     meta l4proto icmpv6 accept
 
-    limit rate ${LOG_RATE} log prefix "tripwire-egress-other " flags skuid
+    # ct state new, like the container rule above: an expired conntrack
+    # entry turns a late FIN or RST for a persona connection into an
+    # invalid packet with no socket owner, and logging those would report
+    # the scanner's own address as something this VM tried to reach.
+    ct state new limit rate ${LOG_RATE} log prefix "tripwire-egress-other " flags skuid
     counter drop
   }
 
@@ -682,6 +712,7 @@ cmd_confirm() {
 
 cmd_rollback() {
   need_root --rollback
+  local rc=0
   # Deliberately independent of the env file: the day this is needed may be
   # the day somebody broke it.
   # shellcheck disable=SC1091
@@ -715,9 +746,30 @@ cmd_rollback() {
   systemctl daemon-reload || true
   reload_sshd
   wg syncconf "$WG_IFACE" <(wg-quick strip "$WG_IFACE") > /dev/null 2>&1 || true
-  rm -f "$STATE_DIR/confirmed"
   rm -rf "$STATE_DIR/pending"
+
+  # A second --apply on a host that was already confirmed snapshots the
+  # ruleset that was in force. Deleting the table and stopping there would
+  # leave that host with no egress block until the next reboot, which is the
+  # opposite of what a rollback is for. So: if the file was there before
+  # this apply, it has just been restored, and it goes back into the kernel.
+  if [[ -f "$STATE_DIR/manifest" ]] &&
+     awk -F'\t' -v p="$NFT_FILE" '$1 == "PRESENT" && $3 == p { found = 1 }
+                                  END { exit !found }' "$STATE_DIR/manifest"; then
+    if nft -f "$NFT_FILE"; then
+      touch "$STATE_DIR/confirmed"
+      say "Reloaded the ruleset that was confirmed before this apply."
+    else
+      warn "could not load $NFT_FILE: THIS HOST HAS NO FIREWALL. Load it by hand."
+      rm -f "$STATE_DIR/confirmed"
+      rc=1
+    fi
+  else
+    rm -f "$STATE_DIR/confirmed"
+  fi
+
   say "Rolled back. The snapshot of the previous ruleset is ${STATE_DIR}/ruleset.nft."
+  return "$rc"
 }
 
 cmd_check() {
@@ -795,7 +847,7 @@ cmd_check() {
     item ok "not confirmed yet: reverts on reboot, by design"
   fi
 
-  local wgconf="/etc/wireguard/${WG_IFACE}.conf"
+  local wgconf="${WG_DIR}/${WG_IFACE}.conf"
   if [[ -f "$wgconf" ]]; then
     verdict "AllowedIPs is ${COLLECTOR_WG}/${WG_BITS}" \
       bash -c "grep -qE '^[[:space:]]*AllowedIPs[[:space:]]*=[[:space:]]*${COLLECTOR_WG}/${WG_BITS}[[:space:]]*\$' '$wgconf'"
@@ -871,7 +923,7 @@ reload_sshd() {
 }
 
 fix_wireguard() {
-  local conf="/etc/wireguard/${WG_IFACE}.conf"
+  local conf="${WG_DIR}/${WG_IFACE}.conf"
   [[ -f "$conf" ]] || { warn "no $conf; leaving WireGuard alone"; return 0; }
   if (($(grep -c '^\[Peer\]' "$conf") > 1)); then
     warn "$conf has more than one peer; not touching AllowedIPs"
@@ -984,6 +1036,23 @@ cmd_selftest() {
     diff <(sed -n '/^  chain output {/,/^  }$/p' "$1") \
          <(sed -n '/^  chain output {/,/^  }$/p' "$2") > /dev/null
   }
+  first_line() { grep -n -- "$2" "$1" | head -1 | cut -d: -f1; }
+  # The tunnel accept has to sit below the container drop -- otherwise a
+  # container uid can use the collector's public address as a way out on any
+  # UDP port -- and above the rules for system uids.
+  chain_order_ok() {
+    local drop tunnel system
+    drop="$(first_line "$1" 'skuid { 1000, 100000-165535 } counter drop')"
+    tunnel="$(first_line "$1" 'daddr 192.0.2.200')"
+    system="$(first_line "$1" 'skuid 0-999')"
+    [[ -n "$drop" && -n "$tunnel" && -n "$system" ]] || return 1
+    ((drop < tunnel)) && ((tunnel < system))
+  }
+  # ... and the last rule of the output chain is an unconditional drop.
+  ends_in_drop() {
+    sed -n '/^  chain output {/,/^  }$/p' "$1" | tail -2 | head -1 |
+      grep -qx '    counter drop'
+  }
 
   # 1 is `bash -n`, run from the command line; 7 is egress-watch.py.
   # 2: a plain render.
@@ -998,6 +1067,10 @@ cmd_selftest() {
   check "2 no FAKEVM anywhere"             bash -c "! grep -rq FAKEVM '$tmp/plain'"
   check "2 no llm4 anywhere"               bash -c "! grep -rq llm4 '$tmp/plain'"
   check "2 no empty set literal"           bash -c "! grep -rqF '{ }' '$tmp/plain'"
+  check "2 the tunnel accept is below the container drop" chain_order_ok "$nft"
+  check "2 the catch-all log is ct state new" \
+    grep -q 'ct state new limit rate 30/minute log prefix "tripwire-egress-other "' "$nft"
+  check "2 the output chain ends in an unconditional drop" ends_in_drop "$nft"
 
   # 3: the fake-VM keys filled.
   sample_env "$tmp/fakevm.env" fakevm
@@ -1042,6 +1115,57 @@ cmd_selftest() {
   check "9 no sshd drop-in when off" bash -c "! test -e '$tmp/nosshd${SSHD_CONF}'"
   check "9 a drop-in when on"        test -f "$tmp/plain${SSHD_CONF}"
   check "9 the firewall is unaffected" diff "$tmp/nosshd${NFT_FILE}" "$nft"
+
+  # 10: the rollback state machine, driven against a fake root with stubs on
+  # PATH standing in for nft, systemd and wg. The case that matters is the
+  # second --apply on a host that was already confirmed: deleting the table
+  # and stopping there would leave it with no firewall until a reboot.
+  local bin="$tmp/bin" name
+  mkdir -p "$bin"
+  cat > "$bin/stub" <<'STUB'
+#!/usr/bin/env bash
+printf '%s %s\n' "${0##*/}" "$*" >> "$STUB_LOG"
+[[ "${0##*/}" == id ]] && echo 0
+exit 0
+STUB
+  chmod +x "$bin/stub"
+  for name in nft systemctl sysctl wg wg-quick id; do cp "$bin/stub" "$bin/$name"; done
+
+  rollback_cycle() { # rollback_cycle ROOT LOG first|reapply
+    local root="$1"
+    mkdir -p "$root/etc"
+    (
+      set +e
+      export STUB_LOG="$2"
+      PATH="$bin:$PATH"
+      STATE_DIR="$root/state"
+      NFT_FILE="$root/etc/tripwire.nft"      NFT_MAIN="$root/etc/nftables.conf"
+      SSHD_CONF="$root/etc/10-tripwire.conf" SYSCTL_CONF="$root/etc/60-tripwire.conf"
+      APT_CONF="$root/etc/52-tripwire"       EGRESS_UNIT="$root/etc/egress.service"
+      WG_DIR="$root/etc/wireguard"
+      WG_IFACE=wgtest0 SSHD_HARDEN=yes FAKEVM_UID=""
+      snapshot
+      if [[ "$3" == reapply ]]; then
+        mkdir -p "$(dirname "${STATE_DIR}/pending${NFT_FILE}")"
+        printf 'RULESET ONE\n' > "${STATE_DIR}/pending${NFT_FILE}"
+        cmd_confirm
+        snapshot                             # the second --apply
+      fi
+      cmd_rollback
+    ) > /dev/null 2>&1
+  }
+
+  rollback_cycle "$tmp/rb1" "$tmp/rb1.log" reapply
+  check "10 the confirmed ruleset is loaded again" \
+    grep -qx "nft -f $tmp/rb1/etc/tripwire.nft" "$tmp/rb1.log"
+  check "10 the ruleset file is restored" grep -q 'RULESET ONE' "$tmp/rb1/etc/tripwire.nft"
+  check "10 the confirmed flag is back"   test -f "$tmp/rb1/state/confirmed"
+
+  rollback_cycle "$tmp/rb2" "$tmp/rb2.log" first
+  check "10 a first apply loads nothing back" bash -c "! grep -q 'nft -f' '$tmp/rb2.log'"
+  check "10 the table is still deleted"  grep -q 'nft delete table inet tripwire' "$tmp/rb2.log"
+  check "10 no confirmed flag"           bash -c "! test -e '$tmp/rb2/state/confirmed'"
+  check "10 no ruleset file"             bash -c "! test -e '$tmp/rb2/etc/tripwire.nft'"
 
   ((rc == 0)) && say "selftest ok"
   return "$rc"
