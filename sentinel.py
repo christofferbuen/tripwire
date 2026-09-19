@@ -76,11 +76,15 @@ sockets that write to a log.
 
 What it keeps. Besides who connected and what they said, the sentinel hashes
 the shape of the client's own protocol stack: its SSH algorithm lists
-(HASSH), the order of its HTTP headers, and its TLS ClientHello (JA4). None
-of it is sent back to the client, and none of it changes what the client
-sees; it is read from bytes that were arriving anyway. An address is cheap
-identity and these are not, which is what makes the same tool recognisable
-from a new address next week.
+(HASSH), the order of its HTTP headers, and its TLS ClientHello (JA4,
+wherever the hello arrives, not only on 443). To that it adds what the
+kernel measured about the connection without being asked -- round trip time,
+its variance, the send MSS -- and, when the client turns out to be speaking
+something other than the port's protocol, the name of what it spoke. None of
+it is sent back to the client, and none of it changes what the client sees;
+it is read from bytes that were arriving anyway and from a socket option. An
+address is cheap identity and these are not, which is what makes the same
+tool recognisable from a new address next week.
 
 Data note. Ports 25 and 3306 collect login attempts, and those contain
 credentials belonging to whoever was sprayed before you. Treat the log as
@@ -91,6 +95,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import hashlib
 import json
@@ -711,14 +716,198 @@ def ja4(hello: dict) -> str:
     return f"{a}_{b}_{c}"
 
 
-async def read_until(reader, complete, cap: int, timeout: float) -> bytes:
+def _note_client_hello(note: dict[str, object], data: bytes) -> bool:
+    """Record a ClientHello, whichever port it turned up on."""
+    hello = parse_client_hello(data)
+    if hello is None:
+        return False
+    note["tls_ja4"] = ja4(hello)
+    note["tls_version"] = hello["version"]
+    if hello["sni"]:
+        note["tls_sni"] = hello["sni"]
+    if hello["alpn"]:
+        note["tls_alpn"] = hello["alpn"][0].decode("utf-8", "replace")[:32]
+    return True
+
+
+# Of the first 32 bytes, before the client counts as speaking something
+# binary rather than a text protocol with an unusual verb.
+SNIFF_BINARY_RATIO = 0.25
+
+_HTTP_REQUEST = re.compile(rb"^[A-Z]{3,8} \S+ HTTP/1\.[01]\r?\n")
+_PRINTABLE = frozenset(range(0x09, 0x0E)) | frozenset(range(0x20, 0x7F))
+
+
+def sniff_protocol(data: bytes) -> str | None:
+    """Name the protocol the client is speaking, from its first bytes.
+
+    A client that sends a ClientHello to 22 or an RDP connection request to
+    25 is not confused: it is a scanner working through a list of protocols
+    on every open port, and which list it carries is a better description of
+    the tool than the port it happened to knock on. None means the bytes are
+    ordinary text, which on a text protocol's own port says nothing.
+    """
+    if data.startswith(b"SSH-"):
+        return "ssh"
+    if len(data) >= 5 and data[0] == 0x16 and data[1] == 0x03:
+        return "tls"
+    if data[:2] == b"\x03\x00" or b"mstshash=" in data[:64]:
+        return "rdp"
+    if _HTTP_REQUEST.match(data):
+        return "http"
+    if data.startswith(b"MGLNDD_"):     # a scanner that announces itself
+        return "mglndd"
+    head = data[:32]
+    odd = sum(b not in _PRINTABLE for b in head)
+    if head and odd > len(head) * SNIFF_BINARY_RATIO:
+        return "binary"
+    return None
+
+
+def note_mismatch(note: dict[str, object], data: bytes,
+                  native: str) -> str | None:
+    """Record what the client spoke when it was not this port's protocol."""
+    spoken = sniff_protocol(data)
+    if spoken is not None and spoken != native:
+        note["proto_mismatch"] = spoken
+    return spoken
+
+
+def _angle_address(text: str) -> str:
+    """The address between the angle brackets, which is where SMTP puts it."""
+    start = text.find("<")
+    end = text.find(">", start + 1)
+    return text[start + 1:end] if start >= 0 and end > start else ""
+
+
+def _auth_user(argument: str) -> str:
+    """The login name out of an AUTH command that carried its own data."""
+    mechanism, _, blob = argument.strip().partition(" ")
+    if not blob.strip():
+        return ""
+    try:
+        # validate=True so that a password sprayer's malformed blob is
+        # dropped rather than silently decoded into something misleading.
+        text = base64.b64decode(blob.strip(), validate=True).decode(
+            "utf-8", "replace")
+    except ValueError:                  # binascii.Error is one of these
+        return ""
+    if mechanism.upper() == "LOGIN":
+        return text[:128]
+    if mechanism.upper() == "PLAIN":
+        # authzid NUL authcid NUL password. The password stays where it
+        # already is, in smtp_commands, and is not lifted out here.
+        fields = text.split("\x00")
+        return fields[1][:128] if len(fields) > 2 else ""
+    return ""
+
+
+def smtp_identity(commands: list[str]) -> dict[str, object]:
+    """Who the client said it was, out of the commands it sent.
+
+    Every name here is chosen by the sender and none of them is evidence of
+    anything, which is exactly what makes them worth keeping: the same tool
+    sends the same invented HELO and the same target address from every
+    rented address it runs on.
+    """
+    found: dict[str, object] = {}
+    recipients: list[str] = []
+    for command in commands:
+        verb, _, argument = command.partition(" ")
+        verb = verb.upper()
+        if verb in ("EHLO", "HELO"):
+            if argument.strip():
+                found.setdefault("smtp_helo", argument.strip()[:255])
+        elif verb == "MAIL":
+            if sender := _angle_address(command):
+                found.setdefault("smtp_mail_from", sender[:320])
+        elif verb == "RCPT":
+            address = _angle_address(command)[:320]
+            if address and address not in recipients and len(recipients) < 8:
+                recipients.append(address)
+        elif verb == "AUTH":
+            if user := _auth_user(argument):
+                found.setdefault("smtp_auth_user", user)
+    if recipients:
+        found["smtp_rcpt"] = recipients
+    return found
+
+
+def host_is_foreign(value: str, sockname: str, hostname: str) -> bool:
+    """Does the Host header name somewhere that is not this machine.
+
+    A client that asks this address for somewhere else is using it as a
+    proxy, or checking whether it is one. The ordinary case, a scanner
+    echoing back the address it dialled, is not worth a field.
+    """
+    named = value.strip().lower()
+    if named.startswith("["):               # bracketed IPv6, with or without port
+        named = named[1:].partition("]")[0]
+    elif ":" in named:
+        named = named.partition(":")[0]
+    return bool(named) and named not in (sockname.lower(), hostname.lower())
+
+
+# ---------------------------------------------------------------------------
+# What the kernel already knows about the connection
+#
+# The round trip time the kernel measured while the connection was open is a
+# property of where the client actually is. It is not forgeable from the
+# other end, it costs one getsockopt, and the client cannot tell it was read.
+# Linux only; everywhere else these quietly return nothing.
+# ---------------------------------------------------------------------------
+
+TCP_INFO = getattr(socket, "TCP_INFO", None)
+
+
+def parse_tcp_info(raw: bytes) -> dict[str, float | int]:
+    """RTT, its variance and the send MSS out of Linux's struct tcp_info.
+
+    Eight single-byte fields, then 32-bit words in native order:
+    tcpi_snd_mss at offset 16, tcpi_rtt at 68 and tcpi_rttvar at 72, both in
+    microseconds. An older kernel returns a shorter structure, and a zero
+    RTT means nothing was ever measured; both give nothing rather than a
+    field full of zeroes.
+    """
+    if len(raw) < 76:
+        return {}
+    snd_mss = struct.unpack_from("=I", raw, 16)[0]
+    rtt, rttvar = struct.unpack_from("=II", raw, 68)
+    if not rtt:
+        return {}
+    return {"tcp_rtt_ms": round(rtt / 1000, 3),
+            "tcp_rttvar_ms": round(rttvar / 1000, 3),
+            "tcp_mss": snd_mss}
+
+
+def sample_tcp_info(writer) -> dict[str, float | int]:
+    """Ask this connection's socket, or say nothing at all."""
+    sock = writer.get_extra_info("socket") if TCP_INFO is not None else None
+    if sock is None:
+        return {}
+    try:
+        return parse_tcp_info(sock.getsockopt(socket.IPPROTO_TCP, TCP_INFO, 104))
+    except OSError:
+        return {}
+
+
+def local_address(writer) -> str:
+    """The address this connection arrived on."""
+    info = writer.get_extra_info("sockname")
+    return str(info[0]) if info else ""
+
+
+async def read_until(reader, complete, cap: int, timeout: float,
+                     seed: bytes = b"") -> bytes:
     """Accumulate bytes until complete(buf), or the cap or the clock stops us.
 
     A fingerprint is a hash of a whole structure, so one read() of whatever
     the first segment carried is not enough: the client's KEXINIT and its
-    ClientHello both routinely arrive in pieces.
+    ClientHello both routinely arrive in pieces. A caller that has already
+    taken bytes off this stream passes them as seed, so that the structure
+    is parsed whole without a second read being needed to find that out.
     """
-    buf = b""
+    buf = seed
     deadline = time.monotonic() + timeout
     while len(buf) < cap and not complete(buf):
         left = deadline - time.monotonic()
@@ -865,6 +1054,11 @@ class Sentinel:
                 reader.readline(), timeout=TIMEOUTS["ssh"])
         if client_ident:
             note["ssh_client"] = client_ident.decode("utf-8", "replace").strip()[:120]
+        # What the client is really speaking. A TLS hello or an RDP
+        # connection request arriving on 22 is a scanner trying its whole
+        # list on one socket, and the hello carries a JA4 whether or not
+        # this host has a certificate anywhere.
+        spoken = note_mismatch(note, client_ident, "ssh")
 
         # A real KEXINIT. This is what makes `nmap -sV` and ssh-audit report
         # a normal OpenSSH server rather than an unidentified socket.
@@ -875,15 +1069,24 @@ class Sentinel:
         # Read the client's own KEXINIT whole rather than whatever the first
         # segment happened to carry: HASSH is a hash of all four lists, so a
         # packet split across segments is a packet with no fingerprint.
+        # A hello has no line in it, so readline() returned the front of it
+        # rather than a line: put those bytes back at the head of the read
+        # instead of taking another one. It is the same single read as
+        # before, so the connection is held as long as it always was and
+        # closed at the same point.
+        seed = client_ident if spoken == "tls" else b""
         data = await read_until(reader, _ssh_packet_complete,
-                                65536, TIMEOUTS["ssh"])
-        note["bytes_received"] = note.get("bytes_received", 0) + len(data)
+                                65536, TIMEOUTS["ssh"], seed)
+        note["bytes_received"] = (note.get("bytes_received", 0)
+                                  + len(data) - len(seed))
         if data[5:6] == bytes([20]):
             note["ssh_kexinit_received"] = True
         lists = parse_kexinit(data)
         if lists:
             note["ssh_hassh"] = hassh(lists)
             note["ssh_kex_client"] = lists["kex"][:512]
+        if spoken == "tls":
+            _note_client_hello(note, data)
 
         # Stop here. Completing the key exchange needs a host key signature,
         # and there is no signing primitive in the standard library. Going
@@ -892,7 +1095,7 @@ class Sentinel:
         # published signature of the well-known SSH tarpits.
 
     async def do_http(self, reader, writer, note: dict[str, object],
-                      port: int) -> None:
+                      port: int, local: str = "") -> None:
         """Enough HTTP to be an unremarkable web server, including keep-alive."""
         server = str(self.persona["http_server"])
         requests: list[str] = []
@@ -930,6 +1133,9 @@ class Sentinel:
                 note.setdefault("http_user_agent", headers["user-agent"])
             if "host" in headers:
                 note.setdefault("http_host", headers["host"])
+                if first and host_is_foreign(headers["host"], local,
+                                             self.identity.hostname):
+                    note["http_host_foreign"] = True
 
             parts = request.split()
             method = parts[0] if parts else ""
@@ -997,18 +1203,10 @@ class Sentinel:
         buf = await read_until(reader, _hello_complete, 16384,
                                TIMEOUTS["http_header"])
         note["bytes_received"] = note.get("bytes_received", 0) + len(buf)
-        hello = parse_client_hello(buf)
-        if hello is None:
+        if not _note_client_hello(note, buf):
             if buf:
                 note["payload_hex"] = buf[:512].hex()
             return
-
-        note["tls_ja4"] = ja4(hello)
-        note["tls_version"] = hello["version"]
-        if hello["sni"]:
-            note["tls_sni"] = hello["sni"]
-        if hello["alpn"]:
-            note["tls_alpn"] = hello["alpn"][0].decode("utf-8", "replace")[:32]
 
         if self.ssl_context is None:
             return
@@ -1036,7 +1234,7 @@ class Sentinel:
                 return
             incoming.write(chunk)
 
-        await self.do_http(stream, stream, note, port)
+        await self.do_http(stream, stream, note, port, local_address(writer))
 
     def http_404(self, server: str) -> bytes:
         if "Apache" in server:
@@ -1088,6 +1286,8 @@ class Sentinel:
         await writer.drain()
 
         commands: list[str] = []
+        spoken = None
+        raw = b""
         for _ in range(24):
             try:
                 line = await asyncio.wait_for(reader.readline(),
@@ -1096,6 +1296,13 @@ class Sentinel:
                 break
             if not line:
                 break
+            if not commands:
+                # The first thing said on 25 names the protocol when it is
+                # not SMTP. Nothing about the answer changes: a hello read
+                # as a line still gets the 502 it always got.
+                spoken = note_mismatch(note, line, "smtp")
+            if len(raw) < 16384:
+                raw += line
             text = line.decode("utf-8", "replace").strip()[:512]
             commands.append(text)
             verb = text.split(" ")[0].upper() if text else ""
@@ -1147,6 +1354,12 @@ class Sentinel:
 
         if commands:
             note["smtp_commands"] = commands[:24]
+            note.update(smtp_identity(commands))
+        if spoken == "tls":
+            # A ClientHello has no line structure; readline() cut it into
+            # pieces on whatever bytes happened to be 0x0a, and the pieces
+            # joined back up are the hello again.
+            _note_client_hello(note, raw)
 
     async def do_mysql(self, reader, writer, note: dict[str, object]) -> None:
         # Connection ids climb from a base fixed at install time, the way a
@@ -1193,6 +1406,11 @@ class Sentinel:
         peer = writer.get_extra_info("peername")
         ip = peer[0] if peer else "?"
         started = time.monotonic()
+        # Read the kernel's measurements now as well as at the end: a client
+        # that sends one packet and vanishes leaves nothing to ask by the
+        # time the event is built, and the first sample is the handshake's
+        # own round trip, which is the one that cannot be faked by stalling.
+        early = sample_tcp_info(writer)
 
         self.open_conns += 1
         try:
@@ -1224,7 +1442,8 @@ class Sentinel:
                 if role == "https":
                     await self.do_https(reader, writer, note, port)
                 elif role == "http":
-                    await self.do_http(reader, writer, note, port)
+                    await self.do_http(reader, writer, note, port,
+                                       local_address(writer))
                 elif handler is not None:
                     await handler(reader, writer, note)
                 else:
@@ -1265,6 +1484,7 @@ class Sentinel:
                               or note.get("smtp_commands")),
             }
             event.update(note)
+            event.update(sample_tcp_info(writer) or early)
             self.emit(event)
         finally:
             self.open_conns -= 1
@@ -1363,6 +1583,13 @@ def _hello_bytes(*, sni: bool = True, alpn=(b"h2", b"http/1.1"),
             + message[cut:])
 
 
+# An RDP connection request, the form every scanner sends: TPKT header, X.224
+# connection request, and the cookie mstshash= that names the user it is
+# pretending to be.
+_RDP_PROBE = (b"\x03\x00\x00\x2f\x2a\xe0\x00\x00\x00\x00\x00"
+              b"Cookie: mstshash=hello\r\n")
+
+
 def _selftest_live() -> None:
     """One real connection to each of two ports, through the real server."""
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="sentinel-selftest-"))
@@ -1395,24 +1622,92 @@ def _selftest_live() -> None:
     assert client.recv(4096).startswith(b"HTTP/1.1 405 ")
     client.close()
 
+    # The same probes the wire test sends, here for what they record rather
+    # than for what they get back. Each one talks, stops, and reads to EOF.
+    _probe(40022, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")             # W1
+    _probe(40022, _hello_bytes())                                   # W2
+    _probe(40025, _hello_bytes())                                   # W4
+    _probe(40025, b"EHLO WIN-TEST\r\nMAIL FROM:<a@b.example>\r\n"   # W6
+                  b"RCPT TO:<c@d.example>\r\nRCPT TO:<c@d.example>\r\n"
+                  b"AUTH LOGIN dXNlcg==\r\nQUIT\r\n")
+    _probe(40080, b"GET http://judge.example/azenv.php HTTP/1.1\r\n"  # W7
+                  b"Host: judge.example\r\n\r\n")
+    _probe(40080, b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+
     want = hashlib.md5(
         f"{SSH_KEX};{SSH_CIPHER};{SSH_MAC};{SSH_COMPRESSION}".encode(),
         usedforsecurity=False).hexdigest()
     events: list[dict] = []
-    for _ in range(100):
+    for _ in range(200):
         time.sleep(0.05)
         if not log.exists():
             continue
         events = [json.loads(line) for line
                   in log.read_text(encoding="utf-8").splitlines() if line]
-        if (any(e.get("ssh_hassh") for e in events)
-                and any(e.get("http_body") for e in events)):
+        if sum(e.get("kind") == "connect" for e in events) >= 9:
             break
+
+    def pick(why: str, test) -> dict:
+        """The first event matching, or a failure that shows every event.
+
+        Everything in an event came off the wire, so it is printed through
+        ascii(): a probe is allowed to be a terminal escape sequence.
+        """
+        for event in events:
+            if test(event):
+                return event
+        raise AssertionError(f"no event {why} among {ascii(str(events))}")
+
     assert any(e.get("ssh_hassh") == want for e in events), events
     assert any(e.get("ssh_kex_client") == SSH_KEX for e in events), events
     assert any(e.get("http_header_order") == "host,user-agent"
                for e in events), events
     assert any(e.get("http_body") == "username=admin&p=1" for e in events), events
+
+    # 4. The kernel's own numbers, Linux only.
+    if TCP_INFO is None:
+        print("note: no TCP_INFO on this platform, the live RTT assertion "
+              "is skipped")
+    else:
+        measured = [e for e in events if "tcp_rtt_ms" in e]
+        assert measured, "TCP_INFO is present but no event carried tcp_rtt_ms"
+        for event in measured:
+            assert 0 < event["tcp_rtt_ms"] < 50, event["tcp_rtt_ms"]
+            assert event["tcp_mss"] > 0, event["tcp_mss"]
+
+    # 6. Port 22, spoken to in something other than SSH.
+    hello_ja4 = ja4(parse_client_hello(_hello_bytes()))
+    w1 = pick("for the HTTP request on 22",
+              lambda e: str(e.get("ssh_client", "")).startswith("GET /"))
+    assert w1.get("proto_mismatch") == "http", ascii(str(w1))
+    assert w1["ssh_client"] == "GET / HTTP/1.1", ascii(w1["ssh_client"])
+    w2 = pick("for the hello on 22",
+              lambda e: e.get("role") == "ssh" and e.get("tls_ja4"))
+    assert w2.get("proto_mismatch") == "tls", ascii(str(w2))
+    assert w2["tls_ja4"] == hello_ja4, (w2["tls_ja4"], hello_ja4)
+    real = pick("for the SSH client",
+                lambda e: e.get("ssh_client") == "SSH-2.0-Test")
+    assert "proto_mismatch" not in real, ascii(str(real))
+
+    # 7. Port 25, the same, and what the session said about itself.
+    w4 = pick("for the hello on 25",
+              lambda e: e.get("role") == "smtp" and e.get("tls_ja4"))
+    assert w4.get("proto_mismatch") == "tls", ascii(str(w4))
+    assert w4["tls_ja4"] == hello_ja4, (w4["tls_ja4"], hello_ja4)
+    w6 = pick("for the SMTP session", lambda e: e.get("smtp_helo"))
+    assert "proto_mismatch" not in w6, ascii(str(w6))
+    assert w6["smtp_helo"] == "WIN-TEST", ascii(w6["smtp_helo"])
+    assert w6["smtp_mail_from"] == "a@b.example", ascii(w6["smtp_mail_from"])
+    assert w6["smtp_rcpt"] == ["c@d.example"], ascii(str(w6["smtp_rcpt"]))
+    assert w6["smtp_auth_user"] == "user", ascii(w6["smtp_auth_user"])
+
+    # 9. A Host header naming somewhere else.
+    w7 = pick("for the proxy-judge request",
+              lambda e: e.get("http_host") == "judge.example")
+    assert w7.get("http_host_foreign") is True, ascii(str(w7))
+    mine = pick("for the request naming this address",
+                lambda e: e.get("http_host") == "127.0.0.1")
+    assert "http_host_foreign" not in mine, ascii(str(mine))
 
 
 # What the server puts on the wire for each probe below, recorded against a
@@ -1532,8 +1827,7 @@ def _wire_transcripts() -> dict[str, bytes]:
     probes = (
         ("W1", 41022, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
         ("W2", 41022, _hello_bytes()),
-        ("W3", 41022, b"\x03\x00\x00\x2f\x2a\xe0\x00\x00\x00\x00\x00"
-                      b"Cookie: mstshash=hello\r\n"),
+        ("W3", 41022, _RDP_PROBE),
         ("W4", 41025, _hello_bytes()),
         ("W5", 41025, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
         ("W6", 41025, b"EHLO WIN-TEST\r\nMAIL FROM:<a@b.example>\r\n"
@@ -1603,6 +1897,41 @@ def selftest() -> int:
                               "HTTP/1.1")[1] != digest
     assert header_fingerprint(["Accept: a", "Accept: b"],
                               "HTTP/1.1")[0] == "accept,accept"
+
+    # 1-3. struct tcp_info, which this machine may not have.
+    assert parse_tcp_info(
+        b"\x00" * 16 + struct.pack("=I", 1448) + b"\x00" * 48
+        + struct.pack("=II", 23500, 4200) + b"\x00" * 28) == {
+            "tcp_rtt_ms": 23.5, "tcp_rttvar_ms": 4.2, "tcp_mss": 1448}
+    assert parse_tcp_info(b"") == {}
+    assert parse_tcp_info(b"\x00" * 104) == {}      # a measurement of nothing
+
+    class _NoSocket:
+        def get_extra_info(self, _name):
+            return None
+
+    assert sample_tcp_info(_NoSocket()) == {}
+
+    # 5. What the client is speaking, whatever port it said it on.
+    assert sniff_protocol(b"SSH-2.0-Go\r\n") == "ssh"
+    assert sniff_protocol(_hello_bytes()) == "tls"
+    assert sniff_protocol(_RDP_PROBE) == "rdp"
+    assert sniff_protocol(b"GET / HTTP/1.1\r\n") == "http"
+    assert sniff_protocol(b"MGLNDD_192.0.2.1_22\n") == "mglndd"
+    assert sniff_protocol(bytes(range(32))) == "binary"
+    assert sniff_protocol(b"EHLO x\r\n") is None
+    assert sniff_protocol(b"") is None
+
+    # 8. Names an SMTP client volunteered.
+    assert smtp_identity(
+        ["AUTH PLAIN AHVzZXIAcGFzcw=="])["smtp_auth_user"] == "user"
+    assert "smtp_auth_user" not in smtp_identity(["AUTH LOGIN !!!"])
+    assert smtp_identity(["rcpt to:<A@B>"] * 20)["smtp_rcpt"] == ["A@B"]
+
+    # The bracket and port stripping, which the live test does not reach.
+    assert host_is_foreign("[2001:db8::1]:8080", "2001:db8::1", "h") is False
+    assert host_is_foreign("Example.COM:80", "192.0.2.1", "h") is True
+    assert host_is_foreign("", "192.0.2.1", "h") is False
 
     _selftest_live()
     _selftest_wire()
@@ -1674,6 +2003,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.tls_cert and args.tls_key:
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_context.load_cert_chain(args.tls_cert, args.tls_key)
+
+    if TCP_INFO is None:
+        print("NOTE: no TCP_INFO on this platform, RTT not recorded",
+              file=sys.stderr, flush=True)
 
     if args.host not in ("127.0.0.1", "::1", "localhost"):
         print("NOTE: bound off loopback. Inside a container namespace that is "
