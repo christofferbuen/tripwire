@@ -897,17 +897,14 @@ def local_address(writer) -> str:
     return str(info[0]) if info else ""
 
 
-async def read_until(reader, complete, cap: int, timeout: float,
-                     seed: bytes = b"") -> bytes:
+async def read_until(reader, complete, cap: int, timeout: float) -> bytes:
     """Accumulate bytes until complete(buf), or the cap or the clock stops us.
 
     A fingerprint is a hash of a whole structure, so one read() of whatever
     the first segment carried is not enough: the client's KEXINIT and its
-    ClientHello both routinely arrive in pieces. A caller that has already
-    taken bytes off this stream passes them as seed, so that the structure
-    is parsed whole without a second read being needed to find that out.
+    ClientHello both routinely arrive in pieces.
     """
-    buf = seed
+    buf = b""
     deadline = time.monotonic() + timeout
     while len(buf) < cap and not complete(buf):
         left = deadline - time.monotonic()
@@ -1069,16 +1066,9 @@ class Sentinel:
         # Read the client's own KEXINIT whole rather than whatever the first
         # segment happened to carry: HASSH is a hash of all four lists, so a
         # packet split across segments is a packet with no fingerprint.
-        # A hello has no line in it, so readline() returned the front of it
-        # rather than a line: put those bytes back at the head of the read
-        # instead of taking another one. It is the same single read as
-        # before, so the connection is held as long as it always was and
-        # closed at the same point.
-        seed = client_ident if spoken == "tls" else b""
         data = await read_until(reader, _ssh_packet_complete,
-                                65536, TIMEOUTS["ssh"], seed)
-        note["bytes_received"] = (note.get("bytes_received", 0)
-                                  + len(data) - len(seed))
+                                65536, TIMEOUTS["ssh"])
+        note["bytes_received"] = note.get("bytes_received", 0) + len(data)
         if data[5:6] == bytes([20]):
             note["ssh_kexinit_received"] = True
         lists = parse_kexinit(data)
@@ -1086,7 +1076,13 @@ class Sentinel:
             note["ssh_hassh"] = hassh(lists)
             note["ssh_kex_client"] = lists["kex"][:512]
         if spoken == "tls":
-            _note_client_hello(note, data)
+            # The two reads above are exactly the ones this handler has
+            # always made, so a hello that spans them is only fingerprinted
+            # when it happens to have arrived whole: capture loses to the
+            # timing contract, on purpose. Likewise a hello containing no
+            # 0x0a leaves readline() waiting out the ident timeout, and this
+            # mismatch is missed entirely.
+            _note_client_hello(note, client_ident + data)
 
         # Stop here. Completing the key exchange needs a host key signature,
         # and there is no signing primitive in the standard library. Going
@@ -1626,6 +1622,7 @@ def _selftest_live() -> None:
     # than for what they get back. Each one talks, stops, and reads to EOF.
     _probe(40022, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")             # W1
     _probe(40022, _hello_bytes())                                   # W2
+    _probe(40022, _hello_bytes()[:40])          # a hello that never finishes
     _probe(40025, _hello_bytes())                                   # W4
     _probe(40025, b"EHLO WIN-TEST\r\nMAIL FROM:<a@b.example>\r\n"   # W6
                   b"RCPT TO:<c@d.example>\r\nRCPT TO:<c@d.example>\r\n"
@@ -1644,7 +1641,7 @@ def _selftest_live() -> None:
             continue
         events = [json.loads(line) for line
                   in log.read_text(encoding="utf-8").splitlines() if line]
-        if sum(e.get("kind") == "connect" for e in events) >= 9:
+        if sum(e.get("kind") == "connect" for e in events) >= 10:
             break
 
     def pick(why: str, test) -> dict:
@@ -1685,6 +1682,18 @@ def _selftest_live() -> None:
               lambda e: e.get("role") == "ssh" and e.get("tls_ja4"))
     assert w2.get("proto_mismatch") == "tls", ascii(str(w2))
     assert w2["tls_ja4"] == hello_ja4, (w2["tls_ja4"], hello_ja4)
+    # Every byte the client sent is accounted for exactly once: readline()
+    # took everything up to the first 0x0a and that is in ssh_client, the
+    # rest is bytes_received. This is the split main made and it must not
+    # drift, so the number is not the whole length of the hello.
+    sent = _hello_bytes()
+    assert w2["bytes_received"] == len(sent) - (sent.index(b"\n") + 1), (
+        w2["bytes_received"], len(sent))
+    # A hello that stops in the middle: named, but not fingerprinted.
+    cut = pick("for the truncated hello on 22",
+               lambda e: e.get("role") == "ssh"
+               and e.get("proto_mismatch") == "tls" and "tls_ja4" not in e)
+    assert "tls_version" not in cut, ascii(str(cut))
     real = pick("for the SSH client",
                 lambda e: e.get("ssh_client") == "SSH-2.0-Test")
     assert "proto_mismatch" not in real, ascii(str(real))
