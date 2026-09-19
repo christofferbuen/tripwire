@@ -23,6 +23,7 @@ import io
 import ipaddress
 import json
 import logging
+import math
 import os
 import signal
 import socket
@@ -35,6 +36,14 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+
+# droppers.py (package B2) is written in parallel and may not be mounted yet.
+# Its ledger of second-stage locations is its own business; this module only
+# calls into it once per pass, if it is there.
+try:
+    import droppers
+except ImportError:
+    droppers = None
 
 OS_URL = os.environ.get("OPENSEARCH_URL", "https://opensearch:9200")
 SECRETS_FILE = os.environ.get("SECRETS_FILE", "/run/secrets/tripwire.json")
@@ -69,6 +78,16 @@ LISTS = {
     "firehol:blocklist_de": FIREHOL + "blocklist_de.ipset",            # fail2ban reports, 48 h
     "firehol:greensnow": FIREHOL + "greensnow.ipset",                  # brute force and scan harvesters
     "firehol:dshield": FIREHOL + "dshield.netset",                     # top attacking /24s
+}
+# Lists that are allowed to fail: each one is fetched inside its own try in
+# refresh(), so a single moved or rate-limited source does not take the
+# required lists down with it.
+OPTIONAL_LISTS = {
+    "tor:exits": "https://check.torproject.org/torbulkexitlist",
+    "et:compromised": "https://rules.emergingthreats.net/blockrules/compromised-ips.txt",
+    "cins:army": "https://cinsscore.com/list/ci-badguys.txt",
+    "x4b:vpn": "https://raw.githubusercontent.com/X4BNET/lists_vpn/main/output/vpn/ipv4.txt",
+    "x4b:datacenter": "https://raw.githubusercontent.com/X4BNET/lists_vpn/main/output/datacenter/ipv4.txt",
 }
 IPSUM = "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt"
 IPSUM_MIN = 3  # blocklists that must agree before the score is recorded
@@ -110,6 +129,9 @@ PTR_SCANNERS = {
 
 GREYNOISE = "https://api.greynoise.io/v3/community/"
 ABUSEIPDB = "https://api.abuseipdb.com/api/v2/check?maxAgeInDays=90&ipAddress="
+INTERNETDB = "https://internetdb.shodan.io/"
+DSHIELD = "https://isc.sans.edu/api/ip/"
+OTX = "https://otx.alienvault.com/api/v1/indicators/IPv4/"
 
 log = logging.getLogger("enrich")
 
@@ -270,6 +292,14 @@ class Lists:
                 if status != 200:
                     raise RuntimeError(f"{name} {status}")
                 self.add(name, parse_networks(raw.decode("utf-8", "replace")))
+            for name, url in OPTIONAL_LISTS.items():
+                try:
+                    status, raw = fetch("GET", url)
+                    if status != 200:
+                        raise RuntimeError(f"{name} {status}")
+                    self.add(name, parse_networks(raw.decode("utf-8", "replace")))
+                except Exception as e:
+                    log.warning("optional list %s failed, skipping: %s", name, e)
             status, raw = fetch("GET", IPSUM)
             if status != 200:
                 raise RuntimeError(f"ipsum {status}")
@@ -289,6 +319,17 @@ class Lists:
         names.update(name for net, name in self.nets if ip in net)
         orgs = sorted(n.split(":", 1)[1] for n in names if n.startswith("openfilters:"))
         return orgs[0] if orgs else None, sorted(names), self.ipsum.get(int(ip))
+
+
+def derive_from_lists(names):
+    """tor and hosting out of the list names Lists.match() returned, isolated
+    from lookup() so the selftest can exercise it without a network. The two
+    x4b: names describe the network an address sits on, not an accusation,
+    so they come out of the list of things held against it."""
+    tor = "tor:exits" in names
+    hosting = "vpn" if "x4b:vpn" in names else ("datacenter" if "x4b:datacenter" in names else None)
+    lists = [n for n in names if not n.startswith("x4b:")]
+    return tor, hosting, lists
 
 
 def scanner_from_ptr(host):
@@ -314,14 +355,101 @@ def reverse_dns(ip):
 # Reputation APIs (optional)
 # --------------------------------------------------------------------------
 
+def parse_internetdb(raw):
+    """internetdb's JSON, distrusted the same as attacker text: an unexpected
+    top-level shape yields None, and each field is coerced and dropped on its
+    own rather than aborting the whole document."""
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(d, dict):
+        return None
+    out = {}
+    ports = d.get("ports")
+    if isinstance(ports, list):
+        coerced = []
+        for p in ports:
+            try:
+                coerced.append(int(p))
+            except (TypeError, ValueError):
+                continue
+        if coerced:
+            out["ports"] = coerced[:64]
+    tags = d.get("tags")
+    if isinstance(tags, list):
+        coerced = [str(t)[:64] for t in tags if isinstance(t, str)]
+        if coerced:
+            out["tags"] = coerced[:16]
+    vulns = d.get("vulns")
+    if isinstance(vulns, list):
+        out["vulns_count"] = len(vulns)
+    hostnames = d.get("hostnames")
+    if isinstance(hostnames, list):
+        coerced = [str(h)[:253] for h in hostnames if isinstance(h, str)]
+        if coerced:
+            out["hostnames"] = coerced[:8]
+    return out
+
+
+def parse_dshield(raw):
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(d, dict):
+        return None
+    ip_obj = d.get("ip")
+    if not isinstance(ip_obj, dict):
+        return {}
+    out = {}
+    for key in ("count", "attacks"):
+        try:
+            v = ip_obj.get(key)
+            if v is not None:
+                out[key] = int(v)
+        except (TypeError, ValueError):
+            pass
+    maxdate = ip_obj.get("maxdate")
+    if isinstance(maxdate, str):
+        out["last_seen"] = maxdate[:64]
+    return out
+
+
+def parse_otx(raw):
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(d, dict):
+        return None
+    pulse_info = d.get("pulse_info")
+    if not isinstance(pulse_info, dict):
+        return {}
+    out = {}
+    try:
+        count = pulse_info.get("count")
+        if count is not None:
+            out["pulses"] = int(count)
+    except (TypeError, ValueError):
+        pass
+    return out
+
+
 class Reputation:
     def __init__(self, secrets):
         self.gn_key = secrets.get("greynoise_api_key")
         self.ab_key = secrets.get("abuseipdb_api_key")
+        self.otx_key = secrets.get("otx_api_key")
+        self.lookups = set(secrets.get("lookups", []))  # internetdb, dshield, otx: off unless named
         self.paused = {}  # api -> retry after epoch, set on 429
 
     def _ok(self, name):
         return time.time() >= self.paused.get(name, 0)
+
+    def _pause(self, name):
+        log.warning("%s quota hit, pausing an hour", name)
+        self.paused[name] = time.time() + 3600
 
     def greynoise(self, ip):
         if not self.gn_key or not self._ok("greynoise"):
@@ -329,8 +457,7 @@ class Reputation:
         status, raw = fetch("GET", GREYNOISE + ip,
                             headers={"key": self.gn_key, "Accept": "application/json"}, timeout=15)
         if status == 429:
-            log.warning("greynoise quota hit, pausing an hour")
-            self.paused["greynoise"] = time.time() + 3600
+            self._pause("greynoise")
             return None
         if status == 404:  # not seen scanning and not in RIOT
             return {"noise": False, "riot": False}
@@ -350,8 +477,7 @@ class Reputation:
         status, raw = fetch("GET", ABUSEIPDB + ip,
                             headers={"Key": self.ab_key, "Accept": "application/json"}, timeout=15)
         if status == 429:
-            log.warning("abuseipdb quota hit, pausing an hour")
-            self.paused["abuseipdb"] = time.time() + 3600
+            self._pause("abuseipdb")
             return None
         if status != 200:
             log.warning("abuseipdb %s: %s", ip, status)
@@ -363,6 +489,135 @@ class Reputation:
             if v:
                 out[k] = v
         return out
+
+    def internetdb(self, ip):
+        if "internetdb" not in self.lookups or not self._ok("internetdb"):
+            return None
+        status, raw = fetch("GET", INTERNETDB + ip, headers={"Accept": "application/json"}, timeout=15)
+        if status == 429:
+            self._pause("internetdb")
+            return None
+        if status == 404:  # shodan has nothing on this address
+            return {"ports": []}
+        if status != 200:
+            log.warning("internetdb %s: %s", ip, status)
+            return None
+        return parse_internetdb(raw)
+
+    def dshield(self, ip):
+        if "dshield" not in self.lookups or not self._ok("dshield"):
+            return None
+        status, raw = fetch("GET", DSHIELD + ip + "?json", timeout=15)
+        if status == 429:
+            self._pause("dshield")
+            return None
+        if status != 200:
+            log.warning("dshield %s: %s", ip, status)
+            return None
+        return parse_dshield(raw)
+
+    def otx(self, ip):
+        if "otx" not in self.lookups or not self.otx_key or not self._ok("otx"):
+            return None
+        status, raw = fetch("GET", OTX + ip + "/general",
+                            headers={"X-OTX-API-KEY": self.otx_key}, timeout=15)
+        if status == 429:
+            self._pause("otx")
+            return None
+        if status != 200:
+            log.warning("otx %s: %s", ip, status)
+            return None
+        return parse_otx(raw)
+
+
+# --------------------------------------------------------------------------
+# RTT against geography
+# --------------------------------------------------------------------------
+
+# TCP RTT measures the path to the address, so it tests the GeoIP claim; it
+# does not see through a proxy that terminates the TCP connection itself.
+RTT_KM_PER_MS = 100.0     # light in fibre: about 200 km per ms one way
+DETOUR_FACTOR = 3.0
+DETOUR_SLACK_MS = 80.0
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    r = 6371.0088  # mean Earth radius, km
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def rtt_verdict(rtt_ms, km):
+    """(floor, verdict). floor is the RTT a straight fibre path would need at
+    minimum; well below it the claimed location cannot be reached that fast,
+    well above it something detoured, in between the two do not contradict."""
+    floor = km / RTT_KM_PER_MS
+    if rtt_ms < floor * 0.8:
+        return floor, "impossible"
+    if rtt_ms > floor * DETOUR_FACTOR + DETOUR_SLACK_MS:
+        return floor, "detour"
+    return floor, "plausible"
+
+
+def parse_geo_location(loc):
+    """source.geo.location arrives as {'lat','lon'} straight from the GeoIP
+    processor, or as a 'lat,lon' string when it came back out of an
+    aggregation. (None, None) for anything else."""
+    try:
+        if isinstance(loc, dict):
+            return float(loc["lat"]), float(loc["lon"])
+        if isinstance(loc, str):
+            lat, lon = loc.split(",", 1)
+            return float(lat), float(lon)
+    except (KeyError, ValueError, TypeError):
+        pass
+    return None, None
+
+
+# --------------------------------------------------------------------------
+# Fake crawlers
+# --------------------------------------------------------------------------
+
+# Reverse-DNS suffix a genuine crawler's PTR ends in. Anyone whose user agent
+# claims one of these names and whose PTR does not round-trip is lying.
+CRAWLERS = {
+    "googlebot": ("googlebot.com", "google.com"),
+    "bingbot": ("search.msn.com",),
+    "yandexbot": ("yandex.ru", "yandex.net", "yandex.com"),
+    "baiduspider": ("baidu.com", "baidu.jp"),
+    "duckduckbot": ("duckduckgo.com",),
+    "applebot": ("applebot.apple.com",),
+}
+
+
+def claimed_crawler(user_agents):
+    """First CRAWLERS name found, case-insensitively, in any of the user
+    agent strings an address has sent."""
+    lowered = [ua.lower() for ua in user_agents]
+    for name in CRAWLERS:
+        if any(name in ua for ua in lowered):
+            return name
+    return None
+
+
+def crawler_verified(name, ptr, ip_text, resolve=socket.gethostbyname_ex):
+    """PTR ends in one of the name's suffixes (the same tail-only match as
+    scanner_from_ptr), and the forward lookup of that PTR agrees it owns
+    ip_text: the round trip a spoofed PTR cannot fake. resolve is a parameter
+    so the selftest needs no network."""
+    if not ptr:
+        return False
+    suffixes = CRAWLERS.get(name, ())
+    if not any(ptr == s or ptr.endswith("." + s) for s in suffixes):
+        return False
+    try:
+        _, _, addrs = resolve(ptr)
+    except (socket.gaierror, socket.herror, OSError):
+        return False
+    return ip_text in addrs
 
 
 # --------------------------------------------------------------------------
@@ -377,10 +632,16 @@ BOOK_MAPPING = {
         "properties": {
             "ip": {"type": "ip"}, "ptr": {"type": "keyword"}, "scanner": {"type": "keyword"},
             "lists": {"type": "keyword"}, "ipsum_score": {"type": "integer"},
+            "tor": {"type": "boolean"}, "hosting": {"type": "keyword"},
+            "fake_crawler": {"type": "keyword"},
             "scope": {"type": "keyword"},
             "first_seen": {"type": "date"}, "checked": {"type": "date"},
             "first_seen_sentinel": {"type": "date"},
             "first_seen_receiver": {"type": "date"},
+            "honeypot_tagged": {"type": "boolean"},
+            "network": {"properties": {
+                "geo_km": {"type": "float"}, "rtt_floor_ms": {"type": "float"},
+                "rtt_verdict": {"type": "keyword"}}},
             "greynoise": {"properties": {
                 "noise": {"type": "boolean"}, "riot": {"type": "boolean"},
                 "classification": {"type": "keyword"}, "name": {"type": "keyword"},
@@ -389,6 +650,13 @@ BOOK_MAPPING = {
                 "score": {"type": "integer"}, "reports": {"type": "integer"},
                 "usage_type": {"type": "keyword"}, "domain": {"type": "keyword"},
                 "is_tor": {"type": "boolean"}}},
+            "internetdb": {"properties": {
+                "ports": {"type": "integer"}, "tags": {"type": "keyword"},
+                "vulns_count": {"type": "integer"}, "hostnames": {"type": "keyword"}}},
+            "dshield": {"properties": {
+                "count": {"type": "integer"}, "attacks": {"type": "integer"},
+                "last_seen": {"type": "date", "ignore_malformed": True}}},
+            "otx": {"properties": {"pulses": {"type": "integer"}}},
         },
     },
 }
@@ -422,9 +690,14 @@ FINGERPRINT_MAPPING = {
 APPLY_SCRIPT = """
 if (ctx._source.source == null) { ctx._source.source = new HashMap(); }
 if (params.domain != null) { ctx._source.source.domain = params.domain; }
+if (params.hosting != null) { ctx._source.source.hosting = params.hosting; }
 if (params.threat != null) {
   if (ctx._source.threat == null) { ctx._source.threat = new HashMap(); }
   ctx._source.threat.putAll(params.threat);
+}
+if (params.network != null) {
+  if (ctx._source.network == null) { ctx._source.network = new HashMap(); }
+  ctx._source.network.putAll(params.network);
 }
 if (params.reputation != null) { ctx._source.reputation = params.reputation; }
 if (params.prior != null) {
@@ -446,7 +719,7 @@ ctx._source.enrichment = params.enrichment;
 
 
 class Enricher:
-    def __init__(self, os_client, lists, reputation):
+    def __init__(self, os_client, lists, reputation, secrets):
         self.os = os_client
         self.lists = lists
         self.rep = reputation
@@ -454,6 +727,10 @@ class Enricher:
         # A honeypot sees thousands of distinct stacks, not millions; give it
         # an LRU or a periodic reload from the book if that stops being true.
         self.known_fingerprints = set()
+        self.sentinel_lat = secrets.get("sentinel_lat")
+        self.sentinel_lon = secrets.get("sentinel_lon")
+        self.sentinel_public_ip = secrets.get("sentinel_public_ip")
+        self.audit_next = 0  # next self-audit, epoch seconds; 0 fires on the first pass
 
     def ensure_book(self):
         for name, mapping in ((BOOK, BOOK_MAPPING), (FINGERPRINT_BOOK, FINGERPRINT_MAPPING)):
@@ -494,6 +771,46 @@ class Enricher:
                 out["first_seen_" + bucket["key"]] = stamp
         return out
 
+    def network(self, ip_text):
+        """RTT against the GeoIP claim, from the sentinel's own samples: the
+        best (lowest) RTT this address has shown, checked against how far
+        away GeoIP says it is. None when either half is missing -- a receiver
+        event has neither, and there is nothing to compute until the sentinel
+        has seen the address itself."""
+        if self.sentinel_lat is None or self.sentinel_lon is None:
+            return None
+        body = {"size": 1, "_source": ["source.geo.location"],
+                "query": {"bool": {"filter": [{"term": {"source.ip": ip_text}},
+                                              {"exists": {"field": "source.geo.location"}}]}},
+                "aggs": {"rtt": {"min": {"field": "network.rtt_ms"}}}}
+        status, doc = self.os.call("POST", f"/{SENTINEL_INDICES}/_search?ignore_unavailable=true", body)
+        if status != 200:
+            log.warning("network %s: %s %s", ip_text, status, doc)
+            return None
+        hits = doc.get("hits", {}).get("hits", [])
+        rtt_ms = doc.get("aggregations", {}).get("rtt", {}).get("value")
+        if not hits or rtt_ms is None:
+            return None
+        loc = (hits[0].get("_source", {}).get("source") or {}).get("geo", {}).get("location")
+        lat, lon = parse_geo_location(loc)
+        if lat is None:
+            return None
+        km = haversine_km(self.sentinel_lat, self.sentinel_lon, lat, lon)
+        floor, verdict = rtt_verdict(rtt_ms, km)
+        return {"geo_km": round(km, 1), "rtt_floor_ms": round(floor, 1), "rtt_verdict": verdict}
+
+    def user_agents(self, ip_text):
+        """Up to 20 distinct User-Agent strings this address has sent, across
+        both producers: what claimed_crawler() checks its claim against."""
+        body = {"size": 0,
+                "query": {"bool": {"filter": [{"term": {"source.ip": ip_text}}]}},
+                "aggs": {"uas": {"terms": {"field": "http.user_agent", "size": 20}}}}
+        status, doc = self.os.call("POST", f"/{EVENT_INDICES}/_search?ignore_unavailable=true", body)
+        if status != 200:
+            log.warning("user_agents %s: %s %s", ip_text, status, doc)
+            return []
+        return [b["key"] for b in doc.get("aggregations", {}).get("uas", {}).get("buckets", [])]
+
     def lookup(self, ip_text):
         status, doc = self.os.call("GET", f"/{BOOK}/_doc/{ip_text}")
         cached = doc.get("_source") if status == 200 else None
@@ -516,6 +833,7 @@ class Enricher:
         if ip.is_global:
             ptr = reverse_dns(ip_text)
             scanner, lists, score = self.lists.match(ip)
+            tor, hosting, lists = derive_from_lists(lists)
             if ptr:
                 entry["ptr"] = ptr
             scanner = scanner_from_ptr(ptr) or scanner
@@ -525,10 +843,28 @@ class Enricher:
                 entry["lists"] = lists
             if score is not None:
                 entry["ipsum_score"] = score
-            for name, result in (("greynoise", self.rep.greynoise(ip_text)),
-                                 ("abuseipdb", self.rep.abuseipdb(ip_text))):
+            if tor:
+                entry["tor"] = True
+            if hosting:
+                entry["hosting"] = hosting
+            # ponytail: one call per API per address is the network cost;
+            # internetdb/otx additionally skip on IPv6 rather than send a
+            # request Shodan/OTX cannot answer.
+            lookups = [("greynoise", self.rep.greynoise(ip_text)),
+                       ("abuseipdb", self.rep.abuseipdb(ip_text)),
+                       ("dshield", self.rep.dshield(ip_text))]
+            if ip.version == 4:
+                lookups.append(("internetdb", self.rep.internetdb(ip_text)))
+                lookups.append(("otx", self.rep.otx(ip_text)))
+            for name, result in lookups:
                 if result:
                     entry[name] = result
+            claimed = claimed_crawler(self.user_agents(ip_text))
+            if claimed and not crawler_verified(claimed, ptr, ip_text):
+                entry["fake_crawler"] = claimed
+            net = self.network(ip_text)
+            if net:
+                entry["network"] = net
         else:
             entry["scope"] = "private"
         self.os.call("PUT", f"/{BOOK}/_doc/{ip_text}", entry)
@@ -537,11 +873,14 @@ class Enricher:
         return entry
 
     def apply(self, entry):
-        threat = {k: entry[k] for k in ("scanner", "lists", "ipsum_score") if entry.get(k) is not None}
-        reputation = {k: entry[k] for k in ("greynoise", "abuseipdb") if entry.get(k)}
+        threat = {k: entry[k] for k in ("scanner", "lists", "ipsum_score", "tor", "fake_crawler")
+                  if entry.get(k) is not None}
+        reputation = {k: entry[k] for k in
+                      ("greynoise", "abuseipdb", "internetdb", "dshield", "otx") if entry.get(k)}
         prior = {f"{who}_first_seen": entry[f"first_seen_{who}"]
                  for who in ("sentinel", "receiver") if entry.get(f"first_seen_{who}")}
-        params = {"domain": entry.get("ptr"), "threat": threat or None,
+        params = {"domain": entry.get("ptr"), "hosting": entry.get("hosting"),
+                  "threat": threat or None, "network": entry.get("network"),
                   "reputation": reputation or None, "prior": prior or None,
                   "enrichment": {"at": now_iso()}}
         body = {"query": {"bool": {"filter": [{"term": {"source.ip": entry["ip"]}},
@@ -597,8 +936,37 @@ class Enricher:
                     continue
                 self.known_fingerprints.add(doc_id)
 
+    def self_audit(self):
+        """What Shodan already knows about the sentinel's own public address.
+        The deception is broken the moment that document says 'honeypot' and
+        nobody noticed -- so ask once per LIST_REFRESH, not every pass, and
+        log the answer every time it is asked."""
+        if "internetdb" not in self.rep.lookups or not self.sentinel_public_ip:
+            return
+        if time.time() < self.audit_next:
+            return
+        self.audit_next = time.time() + LIST_REFRESH
+        result = self.rep.internetdb(self.sentinel_public_ip)
+        if result is None:
+            return
+        tags, ports = result.get("tags", []), result.get("ports", [])
+        entry = {"ip": self.sentinel_public_ip, "scope": "self", "checked": now_iso(),
+                 "internetdb": result, "honeypot_tagged": "honeypot" in tags}
+        self.os.call("PUT", f"/{BOOK}/_doc/self", entry)
+        log.info("self-audit: tags=%s ports=%s", tags, ports)
+
     def cycle(self):
         self.fingerprints()
+        self.self_audit()
+        # Runs every pass, ahead of the early return below, because a pass
+        # with nothing newly pending is still a pass. droppers.py is B2's
+        # file; nothing about it beyond this call and the import guard at
+        # the top of the module is this package's business.
+        if droppers:
+            try:
+                droppers.scan(self.os)
+            except Exception as e:
+                log.warning("droppers scan failed: %s", e)
         ips = self.pending()
         if not ips:
             return
@@ -617,9 +985,19 @@ def main():
         secrets = json.load(fh)
     client = OpenSearch(OS_URL, "admin", secrets["opensearch_password"])
     lists = Lists()
-    enricher = Enricher(client, lists, Reputation(secrets))
-    log.info("reputation: greynoise=%s abuseipdb=%s",
-             bool(secrets.get("greynoise_api_key")), bool(secrets.get("abuseipdb_api_key")))
+    enricher = Enricher(client, lists, Reputation(secrets), secrets)
+    parts = ["greynoise=" + ("on" if secrets.get("greynoise_api_key") else "off (no key)"),
+             "abuseipdb=" + ("on" if secrets.get("abuseipdb_api_key") else "off (no key)")]
+    for name in ("internetdb", "dshield", "otx"):
+        if name not in enricher.rep.lookups:
+            parts.append(f"{name}=off (not enabled)")
+        elif name == "otx" and not enricher.rep.otx_key:
+            parts.append(f"{name}=off (no key)")
+        else:
+            parts.append(f"{name}=on")
+    parts.append("rtt-geo=" + ("on" if enricher.sentinel_lat is not None else "off (no sentinel_lat)"))
+    log.info("lookups: %s", " ".join(parts))
+    log.info("droppers: %s", "on" if droppers else "module not found")
     while True:
         try:
             enricher.ensure_book()
@@ -682,6 +1060,134 @@ def selftest():
         "ja4:t13d1516h2_8daaf6152771_b186095e22b6"
     assert book_id("http", "a/b:c d") == "http:a%2Fb%3Ac%20d"
     assert "/" not in book_id("http", "../../_all")
+
+    # --- B1: bulk lists, opt-in lookups, RTT/geo, fake crawlers, droppers hook ---
+    global fetch, droppers
+    orig_fetch = fetch
+
+    def empty_targz():
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz"):
+            pass
+        return buf.getvalue()
+    targz = empty_targz()
+
+    # 1. An optional source failing does not abort the refresh, and the
+    # other optional sources still load.
+    def fetch_1(method, url, body=None, headers=None, timeout=60):
+        if url == OPENFILTERS:
+            return 200, targz
+        if url == OPTIONAL_LISTS["cins:army"]:
+            return 500, b"server error"
+        if url in OPTIONAL_LISTS.values():
+            return 200, b"5.6.7.8/32\n"
+        if url == IPSUM:
+            return 200, b"9.9.9.9\t5\n"
+        return 200, b"1.2.3.4/32\n"  # every required LISTS url
+    fetch = fetch_1
+    lists1 = Lists()
+    lists1.refresh()
+    assert lists1.loaded_at
+    _, names1, _ = lists1.match(ipaddress.ip_address("5.6.7.8"))
+    assert "tor:exits" in names1 and "cins:army" not in names1, names1
+    fetch = orig_fetch
+
+    # 2. A required source failing keeps the previous lists and backs off
+    # about an hour, same as before this package touched refresh().
+    def fetch_2(method, url, body=None, headers=None, timeout=60):
+        if url == OPENFILTERS:
+            return 200, targz
+        if url == IPSUM:
+            return 500, b"server error"
+        return 200, b"1.2.3.4/32\n"
+    fetch = fetch_2
+    lists2 = Lists()
+    lists2.add("firehol:dshield", parse_networks("10.0.0.0/24"))
+    prev_exact = dict(lists2.exact)
+    lists2.refresh()
+    assert lists2.exact == prev_exact
+    assert 0 < lists2.next_try - time.time() <= 3700, lists2.next_try
+    fetch = orig_fetch
+
+    # 3. tor and hosting derived from list names; the x4b: names describe the
+    # network, not an accusation, so they leave entry["lists"].
+    tor3, hosting3, lists3 = derive_from_lists(["tor:exits", "x4b:vpn", "firehol:dshield"])
+    assert tor3 is True and hosting3 == "vpn"
+    assert "x4b:vpn" not in lists3 and "firehol:dshield" in lists3
+
+    # 4. Paris to Berlin, roughly.
+    assert abs(haversine_km(48.86, 2.35, 52.52, 13.40) - 877) < 5
+
+    # 5. rtt_verdict's three bands, plus the km=0 edge.
+    assert rtt_verdict(1.0, 400) == (4.0, "impossible")
+    assert rtt_verdict(6.0, 400) == (4.0, "plausible")
+    assert rtt_verdict(200.0, 400) == (4.0, "detour")
+    assert rtt_verdict(5.0, 0) == (0.0, "plausible")
+
+    # 6. A claimed crawler name, case-insensitively, or none.
+    assert claimed_crawler(["Mozilla/5.0 (compatible; Googlebot/2.1)"]) == "googlebot"
+    assert claimed_crawler(["curl/8"]) is None
+
+    # 7. PTR suffix match plus the forward round trip; every way that can fail.
+    assert crawler_verified("googlebot", "crawl-1.googlebot.com", "192.0.2.1",
+                            resolve=lambda h: (h, [], ["192.0.2.1"])) is True
+    assert crawler_verified("googlebot", "crawl-1.googlebot.com", "192.0.2.1",
+                            resolve=lambda h: (h, [], ["192.0.2.9"])) is False
+    assert crawler_verified("googlebot", "googlebot.com.evil.example", "192.0.2.1",
+                            resolve=lambda h: (h, [], ["192.0.2.1"])) is False
+
+    def raise_gaierror(host):
+        raise socket.gaierror("nope")
+    assert crawler_verified("googlebot", "crawl-1.googlebot.com", "192.0.2.1",
+                            resolve=raise_gaierror) is False
+    assert crawler_verified("googlebot", None, "192.0.2.1",
+                            resolve=lambda h: (h, [], ["192.0.2.1"])) is False
+
+    # 8. Third-party JSON gets the same distrust as attacker text: never raise,
+    # always None or a well-typed dict, even for 1 MB of garbage.
+    huge = b"a" * (1024 * 1024)
+    for parser in (parse_internetdb, parse_dshield, parse_otx):
+        for raw in (b"[]", b"{}", b'{"ports":"x","tags":7}', huge):
+            result = parser(raw)
+            assert result is None or isinstance(result, dict), (parser.__name__, raw[:20], result)
+
+    # 9. lookups absent from secrets: not one request goes out.
+    calls = []
+
+    def fetch_record(method, url, body=None, headers=None, timeout=60):
+        calls.append(url)
+        return 200, b"{}"
+    fetch = fetch_record
+    rep9 = Reputation({})
+    assert rep9.internetdb("192.0.2.1") is None
+    assert rep9.dshield("192.0.2.1") is None
+    assert rep9.otx("192.0.2.1") is None
+    assert calls == [], calls
+    fetch = orig_fetch
+
+    # 11. droppers is optional at import time and never allowed to break a
+    # pass: None is a no-op, and a scan() that raises is swallowed.
+    class FakeOS:
+        def __init__(self):
+            self.calls = 0
+
+        def call(self, method, path, body=None):
+            self.calls += 1
+            return 200, {}
+
+    class BadDroppers:
+        def scan(self, os_client):
+            raise RuntimeError("boom")
+    orig_droppers = droppers
+    droppers = None
+    os_a = FakeOS()
+    Enricher(os_a, Lists(), Reputation({}), {}).cycle()
+    assert os_a.calls > 0  # fingerprints()/pending() ran
+    droppers = BadDroppers()
+    os_b = FakeOS()
+    Enricher(os_b, Lists(), Reputation({}), {}).cycle()  # must not raise
+    assert os_b.calls > 0
+    droppers = orig_droppers
 
     print("selftest ok")
 
