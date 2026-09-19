@@ -108,7 +108,7 @@ the workstation, in the repo:
 
 ```bash
 for f in enrich.py alerts.py dashboards.py bootstrap-opensearch.sh setup-logging.sh compose.yaml vector.toml; do
-  printf '%s  %s\n' "$(git show 6b78a71:$f | tr -d '\r' | sha256sum | cut -c1-64)" "$f"
+  printf '%s  %s\n' "$(git show da9c980:$f | tr -d '\r' | sha256sum | cut -c1-64)" "$f"
 done
 ```
 
@@ -162,7 +162,7 @@ key names and types only, never values. Pass: every type is `str`. Vector
 reads the same file and refuses all of it, password included, if one value
 is a number or a list. The first sitting found that the hard way: the
 coordinates were written as floats, and Vector did not come back in step 6
-until the renderer was fixed (`7395092`; `test-vector.sh` now renders its
+until the renderer was fixed (`494d27e`; `test-vector.sh` now renders its
 secrets with the real `setup-logging.sh`, so this is caught at the
 workstation).
 

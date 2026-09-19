@@ -116,14 +116,14 @@ Workstation, in the repo:
 
 ```bash
 for f in sentinel.py vector-sentinel.toml compose.sentinel.yaml Containerfile.sentinel; do
-  printf '%s  %s\n' "$(git show 6b78a71:$f | tr -d '\r' | sha256sum | cut -c1-64)" "$f"
+  printf '%s  %s\n' "$(git show da9c980:$f | tr -d '\r' | sha256sum | cut -c1-64)" "$f"
 done
 ```
 
 VM: `cd ~/tripwire && sha256sum sentinel.py vector-sentinel.toml compose.sentinel.yaml Containerfile.sentinel`.
 
 Any mismatch is an edit made on the host (or a deploy older than
-`6b78a71`: try the hash of the commit before). Stop, `diff`, carry the edit
+`da9c980`: try the hash of the commit before). Stop, `diff`, carry the edit
 into the repo or decide to drop it. `compose.sentinel.yaml` is the likely
 one. A changed `sentinel.py` also makes the "before" capture of step 3 a
 capture of something the repo does not know.
