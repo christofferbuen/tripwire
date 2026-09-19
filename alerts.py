@@ -21,6 +21,17 @@ look, one low priority for the daily digest.
                              the real site days or weeks later
   tripwire-novel-fingerprint a client stack (HASSH, JA4 or header order) the
                              sentinel has never seen before
+  tripwire-egress            something on the sentinel VM tried to connect out
+                             and the firewall refused it. Nothing there has
+                             a reason to, so this is the alert that means the
+                             VM is owned: snapshot it from the cloud console,
+                             then destroy it, and do not log in to look first
+  tripwire-novel-dropper     a payload named a second-stage location that is
+                             not in dropper-book yet. Shown defanged, never
+                             fetched
+  tripwire-honeypot-tagged   Shodan's InternetDB tags the sentinel's own
+                             address as a honeypot: the persona has been seen
+                             through. Only with that opt-in lookup enabled
   tripwire-sentinel-silent   no sentinel events for an hour. It sees dozens
                              of connections an hour at its quietest, so an
                              empty hour means the VM, its Vector or WireGuard
@@ -79,11 +90,11 @@ def call(method, path, body=None):
         return err.code, json.loads(err.read() or b"{}")
 
 
-def window(minutes):
+def window(minutes, field="@timestamp"):
     """Range filter over the monitor's own period end, the documented idiom."""
-    return {"range": {"@timestamp": {"gte": f"{{{{period_end}}}}||-{minutes}m",
-                                     "lte": "{{period_end}}",
-                                     "format": "epoch_millis"}}}
+    return {"range": {field: {"gte": f"{{{{period_end}}}}||-{minutes}m",
+                              "lte": "{{period_end}}",
+                              "format": "epoch_millis"}}}
 
 
 def action(message, throttle_minutes=None, per_alert=False, channel_id=CHANNEL_ID):
@@ -104,9 +115,10 @@ def action(message, throttle_minutes=None, per_alert=False, channel_id=CHANNEL_I
 def query_monitor(name, indices, filters, trigger_name, severity, message,
                   minutes=5, size=5, condition="ctx.results[0].hits.total.value > 0",
                   throttle_minutes=None, aggs=None, schedule=None,
-                  channel_id=CHANNEL_ID):
-    search = {"size": size, "sort": [{"@timestamp": "desc"}],
-              "query": {"bool": {"filter": filters + [window(minutes)]}}}
+                  channel_id=CHANNEL_ID, time_field="@timestamp"):
+    search = {"size": size, "sort": [{time_field: "desc"}],
+              "query": {"bool": {"filter": filters
+                                 + [window(minutes, time_field)]}}}
     if aggs:
         search["aggs"] = aggs
     if throttle_minutes is None:
@@ -143,17 +155,27 @@ DIGEST_AGGS = {"by": {
         "receiver": {"bool": {
             "filter": [{"term": {"event.module": "receiver"}}],
             "must_not": [{"term": {"http.user_agent": HEARTBEAT_AGENT}}]}},
-        "sentinel": {"term": {"event.module": "sentinel"}}}},
+        "sentinel": {"bool": {
+            "filter": [{"term": {"event.module": "sentinel"}}],
+            "must_not": [{"term": {"classification": "egress-blocked"}}]}}}},
     "aggs": {"ips": {"cardinality": {"field": "source.ip"}},
              "cc": top("source.geo.country_iso_code"),
              "tiers": top("tier_name", 6),
              "ports": top("port"),
+             "exploits": top("threat.exploit"),
+             "mismatch": {"filter": {"exists": {"field": "proto_mismatch"}}},
+             "rtt_odd": {"filter": {"terms": {"network.rtt_verdict":
+                                              ["impossible", "detour"]}},
+                         "aggs": {"ips": {"cardinality": {"field": "source.ip"}}}},
              "held": {"sum": {"field": "held_ms"}},
              # Sums come back as doubles; format gives a whole number of
              # minutes as value_as_string for the template.
              "held_min": {"bucket_script": {"buckets_path": {"h": "held"},
                                             "script": "Math.round(params.h/60000)",
-                                            "format": "0"}}}}}
+                                            "format": "0"}}}},
+    # Ledger documents carry no event.module, so they land in neither bucket
+    # above; their @timestamp is the event that first named the location.
+    "droppers": {"filter": {"prefix": {"_index": "dropper-book"}}}}
 
 DIGEST_MESSAGE = (
     "Last 24 h\n"
@@ -166,13 +188,20 @@ DIGEST_MESSAGE = (
     "Sentinel: {{doc_count}} connections from {{ips.value}} addresses, "
     "{{held_min.value_as_string}} min held\n"
     " ports: {{#ports.buckets}}{{key}}={{doc_count}} {{/ports.buckets}}\n"
-    " countries: {{#cc.buckets}}{{key}}={{doc_count}} {{/cc.buckets}}"
-    "{{/ctx.results.0.aggregations.by.buckets.sentinel}}")
+    " countries: {{#cc.buckets}}{{key}}={{doc_count}} {{/cc.buckets}}\n"
+    " exploits: {{#exploits.buckets}}{{key}}={{doc_count}} {{/exploits.buckets}}\n"
+    " wrong protocol: {{mismatch.doc_count}}, RTT at odds with GeoIP: "
+    "{{rtt_odd.ips.value}} addresses\n"
+    "{{/ctx.results.0.aggregations.by.buckets.sentinel}}"
+    "New dropper locations: {{ctx.results.0.aggregations.droppers.doc_count}}")
 
 
 HITS = ["tripwire-hits-*"]
 SENTINEL = ["tripwire-sentinel-*"]
 FINGERPRINTS = ["fingerprint-book"]
+DROPPERS = ["dropper-book"]
+ADDRESSES = ["address-book"]
+EGRESS = {"term": {"classification": "egress-blocked"}}
 
 MONITORS = [
     query_monitor(
@@ -215,8 +244,25 @@ MONITORS = [
                 "{{#ctx.newAlerts}}{{bucket_keys}} {{/ctx.newAlerts}}",
                 per_alert=True)]}}],
     },
+    # The one alert that means the VM is owned, so severity 1. Both scopes
+    # fire: "other" is the host outside the containers, which is worse, not
+    # quieter. egress-watch.py already sums a burst into one event.
+    query_monitor(
+        "tripwire-egress", SENTINEL, [EGRESS],
+        "outbound attempt from the sentinel VM", "1",
+        "Sentinel VM tried to connect out. Treat it as owned: snapshot it "
+        "from the cloud console, then destroy it. Do not log in first.\n"
+        "{{#ctx.results.0.hits.hits}}"
+        "{{_source.egress.scope}} uid {{_source.egress.uid}} to "
+        "{{_source.egress.dst_ip}} port {{_source.egress.dst_port}} "
+        "{{_source.egress.proto}} x{{_source.egress.count}}\n"
+        "{{/ctx.results.0.hits.hits}}",
+        throttle_minutes=10),
+    # Egress summaries come from the VM too, but a host that produces only
+    # those is not a working sentinel: they are no sign of life.
     silent_monitor(
-        "tripwire-sentinel-silent", SENTINEL, [], 60,
+        "tripwire-sentinel-silent", SENTINEL,
+        [{"bool": {"must_not": [EGRESS]}}], 60,
         "Sentinel silent: no events for an hour. It normally sees dozens, "
         "so the VM, its Vector or WireGuard is down."),
     silent_monitor(
@@ -251,8 +297,38 @@ MONITORS = [
         "{{_source.tool}} {{_source.ssh_client}}\n"
         "{{/ctx.results.0.hits.hits}}",
         throttle_minutes=5),
+    # Same novelty test as the fingerprint book: @timestamp is the event that
+    # first named the location, so the window has to cover the enricher's
+    # scan lag as well, and the throttle keeps that wider window from
+    # repeating. Only the defanged form goes into a message, so nothing
+    # downstream turns it into a link.
     query_monitor(
-        "tripwire-digest", HITS + SENTINEL, [], "daily", "5", DIGEST_MESSAGE,
+        "tripwire-novel-dropper", DROPPERS, [],
+        "dropper location not seen before", "3",
+        "New second-stage location (defanged, never fetch it).\n"
+        "{{#ctx.results.0.hits.hits}}"
+        "{{_source.kind}} {{_source.url_defanged}} from "
+        "{{_source.first_source_ip}}\n"
+        "{{/ctx.results.0.hits.hits}}",
+        minutes=30),
+    # The enricher rewrites the address-book document "self" once a day with
+    # what InternetDB says about the sentinel's own address, and `checked` is
+    # that document's clock. 26 h so one late pass does not open a gap.
+    query_monitor(
+        "tripwire-honeypot-tagged", ADDRESSES,
+        [{"term": {"scope": "self"}}, {"term": {"honeypot_tagged": True}}],
+        "sentinel tagged as a honeypot", "2",
+        "InternetDB tags the sentinel's own address as a honeypot.\n"
+        "{{#ctx.results.0.hits.hits}}"
+        "tags: {{#_source.internetdb.tags}}{{.}} {{/_source.internetdb.tags}}\n"
+        "{{/ctx.results.0.hits.hits}}",
+        minutes=26 * 60, size=1, throttle_minutes=24 * 60, time_field="checked",
+        schedule={"period": {"interval": 60, "unit": "MINUTES"}}),
+    # dropper-book* rather than the bare name: a wildcard that matches
+    # nothing is not an error, a missing index would cost the whole digest.
+    query_monitor(
+        "tripwire-digest", HITS + SENTINEL + ["dropper-book*"], [], "daily",
+        "5", DIGEST_MESSAGE,
         minutes=24 * 60, size=0, condition="true", throttle_minutes=0,
         aggs=DIGEST_AGGS, channel_id=DIGEST_CHANNEL_ID,
         schedule={"cron": {"expression": "0 7 * * *", "timezone": DIGEST_TZ}}),

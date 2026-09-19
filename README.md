@@ -182,6 +182,68 @@ Each connection is filed as one of:
 | `sweep-interaction` | spoke the protocol while already sweeping |
 | `sweep-detected` | crossed the threshold of distinct ports; one summary per address |
 | `shed-load` | the sensor was at capacity and dropped the connection |
+| `egress-blocked` | not a connection at all: the VM itself tried to connect out, see below |
+
+### What it learns without asking
+
+None of this changes a byte the sentinel sends, or when it closes.
+
+- **Round trip against geography.** The kernel already measured the
+  handshake (`network.rtt_ms`, `network.mss`). With `SENTINEL_LAT` and
+  `SENTINEL_LON` in the collector `.env`, the enricher compares it with the
+  distance to where GeoIP puts the address: light in fibre sets a floor, and
+  `network.rtt_verdict` is `impossible` below it, `detour` far above it,
+  `plausible` otherwise. It tests the GeoIP claim. It says nothing about who
+  is behind a proxy: a relay answers the handshake itself, so the round trip
+  is to the relay.
+- **The wrong protocol.** A TLS hello, an HTTP request or an RDP cookie on
+  22 or 25 lands in `proto_mismatch`. On 22 a hello is fingerprinted only
+  when it arrived whole in the reads the handler always made; capture loses
+  to timing there, on purpose.
+- **SMTP identities.** `smtp.helo`, `smtp.mail_from`, `smtp.rcpt`,
+  `smtp.auth_user`, lifted out of the command list so they can be counted.
+- **Names for what was asked.** Vector tags request lines and bodies with
+  `threat.exploit` from a needle table in `vector-sentinel.toml`, and open
+  proxy checks with `threat.proxy_probe` (`http.host_foreign` is the raw
+  signal). `./test-vector.sh` runs that config against fixed events. The
+  saved search "Unlabelled payloads" is where the next needle comes from.
+- **Second stages.** `droppers.py` runs inside the enricher, reads stored
+  payloads and records every location they tell a victim to fetch from, in
+  `dropper.urls` on the event and once in the `dropper-book` ledger. It
+  parses text and nothing else: it has no socket, never resolves a name and
+  never fetches. Alerts and the ledger view show the defanged form
+  (`hxxp://`, `[.]`). Do not open them either.
+- **Free context.** Tor exit and hosting-range lists are fetched in bulk, so
+  nothing about a visitor leaves the collector. Three per-address lookups
+  exist (Shodan InternetDB, DShield, AlienVault OTX) and are off: each one
+  sends the attacker's address to a third party, which tells that party what
+  your sensor saw. Opt in by name, `ENRICH_LOOKUPS=internetdb,dshield` in
+  `.env`. With `internetdb` on and `SENTINEL_PUBLIC_IP` set, the enricher
+  also asks once a day what InternetDB says about the sentinel itself, and
+  `tripwire-honeypot-tagged` fires if the answer includes `honeypot`.
+
+Addresses that stay for days ("residents") have no panel yet: that needs a
+per-address day count, which is `campaigns.py` work and comes with it.
+
+### When the sentinel itself calls out
+
+`harden-sentinel.sh` puts a default-drop nftables output chain on the VM:
+the tunnel to the collector is allowed, a short build window can be opened
+by hand for image builds, everything else is dropped and logged.
+`egress-watch.py` sums those log lines per minute into events with
+`classification: egress-blocked`, and the `tripwire-egress` monitor pushes
+them at the highest priority. `egress.scope` is `container` for the podman
+user and `other` for anything else on the host.
+
+Nothing on that machine has a reason to connect out, so treat the alert as
+"the VM is owned". Snapshot it from the cloud console, then destroy it and
+build a new one. Do not log in to look first: that hands your key agent and
+your source address to whoever is on it. The one benign cause is an
+administrator running `curl`, `apt` or `git` there outside a build window.
+
+The script can lock you out of a remote machine. Read its header, run
+`--render` and `--selftest` anywhere, and keep the cloud console open for
+the first `--apply`; nothing survives a reboot until `--confirm`.
 
 ## Logging
 
@@ -200,6 +262,10 @@ Two things in the pipeline are not defaults and matter:
   honeypot create unlimited fields and break the cluster. The handful worth
   querying are lifted into fixed fields; the rest travel as opaque text.
   `bootstrap-opensearch.sh` also caps total fields and mapping depth.
+- **The dashboard import overwrites.** Saved objects have fixed ids and
+  `bootstrap-opensearch.sh` imports them with `overwrite=true` on every run,
+  so a panel edited in the browser is reset by the next bootstrap. Copy it
+  under a new name first, or change `dashboards.py`.
 - **Secrets come from a file, not the environment.** Vector 0.57 disabled
   `${VAR}` interpolation in config files. A config still using it does not
   fail loudly: Vector sends the literal string `${OPENSEARCH_PASSWORD}` as

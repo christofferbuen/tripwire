@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """Print the Dashboards saved objects for tripwire as ndjson.
 
-One overview dashboard, the visualisations on it and two saved searches, all
-on the `tripwire` index pattern that bootstrap-opensearch.sh creates. Stdlib
-only. bootstrap-opensearch.sh pipes the output into the saved-objects import
+One overview dashboard, the visualisations on it and the saved searches, on
+the `tripwire` index pattern that bootstrap-opensearch.sh creates (the
+dropper ledger view is on its own `dropper-book` pattern). Stdlib only. bootstrap-opensearch.sh pipes the output into the saved-objects import
 API; to load it by hand, redirect to a file and use Stack Management >
 Saved objects > Import in Dashboards.
 
 Everything is keyed by a fixed id so re-importing with overwrite=true updates
-in place instead of piling up copies.
+in place instead of piling up copies. That also means an edit made to one of
+these objects in the Dashboards UI is lost on the next bootstrap: copy the
+object under a new name before changing it.
+
+`--selftest` checks the output against itself and against the mappings in
+bootstrap-opensearch.sh, without a cluster.
 """
 
 import json
+import os
+import re
+import sys
 
 INDEX = {"name": "kibanaSavedObjectMeta.searchSourceJSON.index",
          "type": "index-pattern", "id": "tripwire"}
@@ -48,8 +56,11 @@ def vis(vid, title, vis_type, aggs, params, query=""):
             "references": [INDEX]}
 
 
-def table(vid, title, field, query="", size=15):
-    return vis(vid, title, "table", [count(), terms(field, size)],
+def table(vid, title, field, query="", size=15, split=None):
+    aggs = [count(), terms(field, size)]
+    if split:
+        aggs.append(terms(split, 5, agg_id="3"))
+    return vis(vid, title, "table", aggs,
                {"perPage": 15, "showPartialRows": False,
                 "showMetricsAtAllLevels": False, "showTotal": False,
                 "totalFunc": "sum", "percentageCol": "",
@@ -64,7 +75,7 @@ def pie(vid, title, field, query=""):
                            "truncate": 100}}, query)
 
 
-def timeline(vid, title, split_field):
+def timeline(vid, title, split_field, query=""):
     aggs = [count(),
             {"id": "2", "enabled": True, "type": "date_histogram",
              "schema": "segment",
@@ -97,7 +108,7 @@ def timeline(vid, title, split_field):
         "thresholdLine": {"show": False, "value": 10, "width": 1,
                           "style": "full", "color": "#E7664C"},
     }
-    return vis(vid, title, "histogram", aggs, params)
+    return vis(vid, title, "histogram", aggs, params, query)
 
 
 def world_map(vid, title):
@@ -117,14 +128,14 @@ def world_map(vid, title):
     return vis(vid, title, "tile_map", aggs, params)
 
 
-def saved_search(sid, title, query, columns):
+def saved_search(sid, title, query, columns, pattern="tripwire"):
     return {"id": sid, "type": "search",
             "attributes": {"title": title, "columns": columns,
                            "sort": [["@timestamp", "desc"]], "version": 1,
                            "description": "",
                            "kibanaSavedObjectMeta": {
                                "searchSourceJSON": search_source(query)}},
-            "references": [INDEX]}
+            "references": [dict(INDEX, id=pattern)]}
 
 
 VISUALISATIONS = [
@@ -150,6 +161,17 @@ VISUALISATIONS = [
     # fingerprint says which program sent them, across addresses.
     table("tw-requests", "Sentinel: request lines", "http_requests", SENTINEL, size=20),
     table("tw-hassh", "SSH stacks (HASSH)", "fingerprint.hassh", SENTINEL),
+    # What the connection gives away without being asked: a client speaking
+    # TLS or HTTP to an SSH port, the exploit a request line belongs to, a
+    # round trip that cannot be squared with where GeoIP puts the address.
+    # The verdict tests the GeoIP claim, not who is behind a proxy.
+    table("tw-mismatch", "Spoke the wrong protocol", "proto_mismatch", SENTINEL,
+          split="port"),
+    table("tw-exploits", "Exploits named", "threat.exploit", SENTINEL, size=20),
+    pie("tw-rtt", "RTT against GeoIP", "network.rtt_verdict", SENTINEL),
+    table("tw-helo", "SMTP: EHLO names", "smtp.helo", SENTINEL, size=20),
+    pie("tw-hosting", "Hosting kind", "source.hosting"),
+    timeline("tw-proxy", "Proxy probes", "port", "threat.proxy_probe:true"),
 ]
 
 SEARCHES = [
@@ -170,6 +192,26 @@ SEARCHES = [
     saved_search("tw-search-bodies", "Receiver: posted bodies and odd paths",
                  RECEIVER + " and (body_excerpt:* or tier_name:(collection-post or instruction-follower or tarpit))",
                  ["source.ip", "tier_name", "method", "path", "http.user_agent", "body_excerpt", "canary"]),
+    # dropper.urls is attacker text naming attacker infrastructure: read it,
+    # never open it. The ledger view shows the defanged form only.
+    saved_search("tw-search-droppers", "Droppers", "dropper.urls:*",
+                 ["source.ip", "port", "threat.exploit", "dropper.hosts", "dropper.urls"]),
+    saved_search("tw-search-ledger", "Dropper ledger: first seen", "",
+                 ["kind", "url_defanged", "host", "port", "first_source_ip", "first_index"],
+                 pattern="dropper-book"),
+    # Payloads nothing has a name for yet: the raw material for the next
+    # needle in vector-sentinel.toml.
+    saved_search("tw-search-unlabelled", "Unlabelled payloads",
+                 SENTINEL + " and (http_requests:* or http_body:* or payload_text:*)"
+                 " and not threat.exploit:* and not threat.tool:* and not threat.scanner:*",
+                 ["source.ip", "port", "http.user_agent", "http_requests", "http_body", "payload_text"]),
+    saved_search("tw-search-smtp", "SMTP identities",
+                 SENTINEL + " and (smtp.helo:* or smtp.mail_from:* or smtp.auth_user:*)",
+                 ["source.ip", "smtp.helo", "smtp.mail_from", "smtp.rcpt", "smtp.auth_user",
+                  "smtp.starttls", "proto_mismatch"]),
+    saved_search("tw-search-egress", "Egress attempts", "classification:egress-blocked",
+                 ["egress.scope", "egress.uid", "egress.dst_ip", "egress.dst_port",
+                  "egress.proto", "egress.count"]),
 ]
 
 # (id, x, y, w, h) on a 48-column grid.
@@ -191,6 +233,12 @@ LAYOUT = [
     ("tw-agents", 0, 78, 48, 14),
     ("tw-requests", 0, 92, 32, 16),
     ("tw-hassh", 32, 92, 16, 16),
+    ("tw-exploits", 0, 108, 16, 16),
+    ("tw-mismatch", 16, 108, 16, 16),
+    ("tw-helo", 32, 108, 16, 16),
+    ("tw-rtt", 0, 124, 12, 16),
+    ("tw-hosting", 12, 124, 12, 16),
+    ("tw-proxy", 24, 124, 24, 16),
 ]
 
 
@@ -216,6 +264,60 @@ def dashboard():
             "references": refs}
 
 
+def mapped_fields(text):
+    """Dotted names of every field in one mapping JSON blob."""
+    found = set()
+
+    def walk(props, prefix):
+        for name, spec in props.items():
+            found.add(prefix + name)
+            walk(spec.get("properties", {}), prefix + name + ".")
+    walk(json.loads(text)["properties"], "")
+    return found
+
+
+def selftest():
+    objects = VISUALISATIONS + SEARCHES + [dashboard()]
+    for obj in objects:
+        json.loads(json.dumps(obj))
+    ids = [o["id"] for o in objects]
+    assert len(ids) == len(set(ids)), "duplicate saved object id"
+    placed = [vid for vid, *_ in LAYOUT]
+    assert set(placed) == {v["id"] for v in VISUALISATIONS}, "LAYOUT and VISUALISATIONS disagree"
+    cells = set()
+    for vid, x, y, w, h in LAYOUT:
+        assert x + w <= 48, vid
+        box = {(cx, cy) for cx in range(x, x + w) for cy in range(y, y + h)}
+        assert not box & cells, f"{vid} overlaps another panel"
+        cells |= box
+
+    # Every field a panel or a column names has to be in the index template,
+    # and the block for already-open indices may not name a field the
+    # template lacks: that is how the two drift apart.
+    # ponytail: finds the two blobs by the lines around them, not by parsing sh.
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, "bootstrap-opensearch.sh"), encoding="utf-8") as fh:
+        script = fh.read()
+    template = mapped_fields(
+        re.search(r'"mappings": (\{.*?\n    \})\n', script, re.S).group(1))
+    live = mapped_fields(
+        re.search(r"""/_mapping" '(\{.*?\})' \|\| true""", script, re.S).group(1))
+    assert not live - template, f"only in the live block: {sorted(live - template)}"
+    used = set()
+    for v in VISUALISATIONS:
+        for agg in json.loads(v["attributes"]["visState"])["aggs"]:
+            used.add(agg["params"].get("field"))
+    for s in SEARCHES:
+        if s["references"][0]["id"] == "tripwire":
+            used.update(s["attributes"]["columns"])
+    used -= {None}
+    assert not used - template, f"not in the template: {sorted(used - template)}"
+    print(f"selftest ok: {len(objects)} objects, {len(used)} fields, all mapped")
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        selftest()
+        sys.exit(0)
     for obj in VISUALISATIONS + SEARCHES + [dashboard()]:
         print(json.dumps(obj))

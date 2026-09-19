@@ -17,6 +17,9 @@ identity.json
 *.key
 *.pem
 *.pub
+# test-vector.sh renders throwaway secrets into a temp directory here and
+# removes it on exit; this is for the run that was killed half way.
+.vector-test-secrets.*
 
 # Rendered output carries the live hostname, which is the one string the
 # whole design depends on not being searchable.

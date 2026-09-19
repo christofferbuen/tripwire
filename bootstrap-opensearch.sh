@@ -183,7 +183,7 @@ api PUT /_index_template/tripwire "$(cat <<'EOF'
       "number_of_replicas": 0,
       "refresh_interval": "10s",
       "default_pipeline": "tripwire-enrich",
-      "mapping.total_fields.limit": 250,
+      "mapping.total_fields.limit": 300,
       "mapping.depth.limit": 8,
       "mapping.ignore_malformed": true,
       "plugins.index_state_management.rollover_alias": "tripwire-sentinel"
@@ -224,7 +224,8 @@ api PUT /_index_template/tripwire "$(cat <<'EOF'
                 "organization_name": { "type": "keyword" }
               }
             },
-            "domain": { "type": "keyword" }
+            "domain":  { "type": "keyword" },
+            "hosting": { "type": "keyword" }
           }
         },
 
@@ -233,7 +234,11 @@ api PUT /_index_template/tripwire "$(cat <<'EOF'
             "tool":        { "type": "keyword" },
             "scanner":     { "type": "keyword" },
             "lists":       { "type": "keyword" },
-            "ipsum_score": { "type": "integer" }
+            "ipsum_score": { "type": "integer" },
+            "exploit":      { "type": "keyword" },
+            "proxy_probe":  { "type": "boolean" },
+            "tor":          { "type": "boolean" },
+            "fake_crawler": { "type": "keyword" }
           }
         },
         "reputation": {
@@ -255,7 +260,23 @@ api PUT /_index_template/tripwire "$(cat <<'EOF'
                 "domain":     { "type": "keyword" },
                 "is_tor":     { "type": "boolean" }
               }
-            }
+            },
+            "internetdb": {
+              "properties": {
+                "ports":       { "type": "integer" },
+                "tags":        { "type": "keyword" },
+                "hostnames":   { "type": "keyword" },
+                "vulns_count": { "type": "integer" }
+              }
+            },
+            "dshield": {
+              "properties": {
+                "count":     { "type": "integer" },
+                "attacks":   { "type": "integer" },
+                "last_seen": { "type": "keyword" }
+              }
+            },
+            "otx": { "properties": { "pulses": { "type": "integer" } } }
           }
         },
         "enrichment": {
@@ -292,7 +313,8 @@ api PUT /_index_template/tripwire "$(cat <<'EOF'
             "x_forwarded_for": { "type": "keyword", "ignore_above": 1024 },
             "header_count":    { "type": "integer" },
             "headers_raw":     { "type": "text", "index": true },
-            "header_order":    { "type": "keyword", "ignore_above": 1024 }
+            "header_order":    { "type": "keyword", "ignore_above": 1024 },
+            "host_foreign":    { "type": "boolean" }
           }
         },
 
@@ -311,6 +333,49 @@ api PUT /_index_template/tripwire "$(cat <<'EOF'
           }
         },
         "ssh": { "properties": { "kex": { "type": "keyword", "ignore_above": 512 } } },
+        "network": {
+          "properties": {
+            "rtt_ms":       { "type": "float" },
+            "rttvar_ms":    { "type": "float" },
+            "mss":          { "type": "integer" },
+            "geo_km":       { "type": "float" },
+            "rtt_floor_ms": { "type": "float" },
+            "rtt_verdict":  { "type": "keyword" }
+          }
+        },
+        "smtp": {
+          "properties": {
+            "helo":      { "type": "keyword", "ignore_above": 256 },
+            "mail_from": { "type": "keyword", "ignore_above": 320 },
+            "rcpt":      { "type": "keyword", "ignore_above": 320 },
+            "auth_user": { "type": "keyword", "ignore_above": 128 },
+            "auth_pass": { "type": "keyword", "ignore_above": 128 },
+            "starttls":  { "type": "boolean" }
+          }
+        },
+        "bait": {
+          "properties": {
+            "served":          { "type": "keyword" },
+            "credential_used": { "type": "boolean" }
+          }
+        },
+        "dropper": {
+          "properties": {
+            "scanned": { "type": "boolean" },
+            "urls":    { "type": "keyword", "ignore_above": 512 },
+            "hosts":   { "type": "keyword", "ignore_above": 256 }
+          }
+        },
+        "egress": {
+          "properties": {
+            "dst_ip":   { "type": "ip", "ignore_malformed": true },
+            "dst_port": { "type": "integer" },
+            "uid":      { "type": "long" },
+            "count":    { "type": "integer" },
+            "proto":    { "type": "keyword" },
+            "scope":    { "type": "keyword" }
+          }
+        },
         "prior": {
           "properties": {
             "sentinel_first_seen": { "type": "date" },
@@ -330,6 +395,7 @@ api PUT /_index_template/tripwire "$(cat <<'EOF'
         "sweeping":        { "type": "boolean" },
         "spoke":           { "type": "boolean" },
         "classification":  { "type": "keyword" },
+        "proto_mismatch":  { "type": "keyword" },
         "bytes_received":  { "type": "long" },
         "ports":           { "type": "integer" },
         "ssh_client":      { "type": "keyword", "ignore_above": 256 },
@@ -353,29 +419,58 @@ echo "  done"
 # enrichment fields and pipeline too; read-only ones under ISM refuse and
 # that is fine, they are on their way out.
 if api GET "/_cat/indices/tripwire-*?h=index" | grep -q tripwire; then
-  api PUT "/tripwire-*/_settings" '{"index.default_pipeline":"tripwire-enrich"}' > /dev/null || true
-  api PUT "/tripwire-*/_mapping" '{"properties":{
+  # The field ceiling moves with the template: the mapped fields alone are
+  # about 150, and an index still at the old 250 would refuse the block below.
+  api PUT "/tripwire-*/_settings" '{"index.default_pipeline":"tripwire-enrich","index.mapping.total_fields.limit":300}' > /dev/null || true
+  live_mapping="$(api PUT "/tripwire-*/_mapping" '{"properties":{
     "source":{"properties":{
       "geo":{"properties":{"country_iso_code":{"type":"keyword"},"country_name":{"type":"keyword"},
              "city_name":{"type":"keyword"},"location":{"type":"geo_point","ignore_malformed":true}}},
       "as":{"properties":{"asn":{"type":"keyword"},"organization_name":{"type":"keyword"}}},
-      "domain":{"type":"keyword"}}},
-    "http":{"properties":{"cf_ipcountry":{"type":"keyword"},"cf_ray":{"type":"keyword"},"header_order":{"type":"keyword"}}},
+      "domain":{"type":"keyword"},"hosting":{"type":"keyword"}}},
+    "http":{"properties":{"cf_ipcountry":{"type":"keyword"},"cf_ray":{"type":"keyword"},"header_order":{"type":"keyword"},
+            "host_foreign":{"type":"boolean"}}},
     "threat":{"properties":{"tool":{"type":"keyword"},"scanner":{"type":"keyword"},
-              "lists":{"type":"keyword"},"ipsum_score":{"type":"integer"}}},
+              "lists":{"type":"keyword"},"ipsum_score":{"type":"integer"},
+              "exploit":{"type":"keyword"},"proxy_probe":{"type":"boolean"},
+              "tor":{"type":"boolean"},"fake_crawler":{"type":"keyword"}}},
     "reputation":{"properties":{
       "greynoise":{"properties":{"noise":{"type":"boolean"},"riot":{"type":"boolean"},
                    "classification":{"type":"keyword"},"name":{"type":"keyword"},
                    "last_seen":{"type":"date","ignore_malformed":true}}},
       "abuseipdb":{"properties":{"score":{"type":"integer"},"reports":{"type":"integer"},
-                   "usage_type":{"type":"keyword"},"domain":{"type":"keyword"},"is_tor":{"type":"boolean"}}}}},
+                   "usage_type":{"type":"keyword"},"domain":{"type":"keyword"},"is_tor":{"type":"boolean"}}},
+      "internetdb":{"properties":{"ports":{"type":"integer"},"tags":{"type":"keyword"},
+                    "hostnames":{"type":"keyword"},"vulns_count":{"type":"integer"}}},
+      "dshield":{"properties":{"count":{"type":"integer"},"attacks":{"type":"integer"},
+                 "last_seen":{"type":"keyword"}}},
+      "otx":{"properties":{"pulses":{"type":"integer"}}}}},
     "fingerprint":{"properties":{"hassh":{"type":"keyword"},"ja4":{"type":"keyword"},"http":{"type":"keyword"}}},
     "tls":{"properties":{"sni":{"type":"keyword"},"alpn":{"type":"keyword"},"version":{"type":"keyword"}}},
     "ssh":{"properties":{"kex":{"type":"keyword"}}},
     "http_body":{"type":"text"},
+    "proto_mismatch":{"type":"keyword"},
+    "network":{"properties":{"rtt_ms":{"type":"float"},"rttvar_ms":{"type":"float"},"mss":{"type":"integer"},
+               "geo_km":{"type":"float"},"rtt_floor_ms":{"type":"float"},"rtt_verdict":{"type":"keyword"}}},
+    "smtp":{"properties":{"helo":{"type":"keyword","ignore_above":256},
+            "mail_from":{"type":"keyword","ignore_above":320},"rcpt":{"type":"keyword","ignore_above":320},
+            "auth_user":{"type":"keyword","ignore_above":128},"auth_pass":{"type":"keyword","ignore_above":128},
+            "starttls":{"type":"boolean"}}},
+    "bait":{"properties":{"served":{"type":"keyword"},"credential_used":{"type":"boolean"}}},
+    "dropper":{"properties":{"scanned":{"type":"boolean"},"urls":{"type":"keyword","ignore_above":512},
+               "hosts":{"type":"keyword","ignore_above":256}}},
+    "egress":{"properties":{"dst_ip":{"type":"ip","ignore_malformed":true},"dst_port":{"type":"integer"},
+              "uid":{"type":"long"},"count":{"type":"integer"},"proto":{"type":"keyword"},"scope":{"type":"keyword"}}},
     "prior":{"properties":{"sentinel_first_seen":{"type":"date"},"receiver_first_seen":{"type":"date"},
              "sentinel_hours":{"type":"float"}}},
-    "enrichment":{"properties":{"at":{"type":"date"}}}}}' > /dev/null || true
+    "enrichment":{"properties":{"at":{"type":"date"}}}}}' || true)"
+  # Not fatal, but never silent: a field that arrives before its mapping is
+  # typed dynamically, and that cannot be undone without a reindex.
+  if grep -q '"acknowledged":true' <<<"$live_mapping"; then
+    echo "  open indices: mappings updated"
+  else
+    echo "  WARNING: open indices refused the mapping update: ${live_mapping:0:300}" >&2
+  fi
 fi
 
 echo "Creating the sentinel write alias."
@@ -437,6 +532,15 @@ if api GET "/_cat/indices/address-book?h=index" | grep -qx address-book; then
     && echo "  address-book pattern done"
 else
   echo "  address-book index not there yet (enricher not started?), pattern skipped"
+fi
+# Same again for the dropper ledger, which droppers.py creates on the
+# enricher's first pass. @timestamp there is the event that first named the
+# location.
+if api GET "/_cat/indices/dropper-book?h=index" | grep -qx dropper-book; then
+  dash POST '/api/saved_objects/index-pattern/dropper-book?overwrite=true' "$(pattern_doc 'dropper-book' '@timestamp')" > /dev/null \
+    && echo "  dropper-book pattern done"
+else
+  echo "  dropper-book index not there yet (enricher not started?), pattern skipped"
 fi
 
 echo "Importing the overview dashboard."

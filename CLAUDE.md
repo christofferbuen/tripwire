@@ -20,7 +20,11 @@ Two hosts, joined by WireGuard.
   container (`network_mode: host`, ports 22/25/80, persona `ubuntu-web`) and a
   Vector that ships over WireGuard to the collector as a write-only user. Its
   image is built on the VM from `Containerfile.sentinel`, so any change to
-  `sentinel.py` needs a rebuild there.
+  `sentinel.py` needs a rebuild there. `harden-sentinel.sh` (default-drop
+  egress, rollback timer) and `egress-watch.py` belong to this host; they
+  are built and tested but NOT applied yet, and the script can lock you out:
+  `--render` and `--selftest` anywhere, `--check` on the VM, `--apply` only
+  with the cloud console open, `--build-window 10` before an image build.
 
 Alerts go to a self-hosted ntfy (topic `tripwire`, two channels: high for
 incidents, low for the 07:00 digest). A cron on the collector fetches the
@@ -32,7 +36,9 @@ monitor watches for it.
 Indices: `tripwire-hits-*` (receiver, 90 d), `tripwire-sentinel-*` (sentinel,
 daily rollover, 30 d), `address-book` (one doc per address, enrichment cache
 plus first-seen per producer), `fingerprint-book` (one doc per distinct
-HASSH / JA4 / header-order hash, created once, `@timestamp` = first sighting).
+HASSH / JA4 / header-order hash, created once, `@timestamp` = first sighting),
+`dropper-book` (one doc per second-stage location named in a payload, same
+convention, written by `droppers.py` inside the enricher).
 
 What the sentinel captures, per protocol (all attacker-controlled strings,
 keep them out of terminals unescaped):
@@ -48,7 +54,14 @@ keep them out of terminals unescaped):
 | `smtp_commands` | up to 24 commands, AUTH data included |
 | `mysql_user` | login name from the handshake response |
 | `payload_text` / `payload_hex` | bytes on ports without a protocol handler, or non-TLS on 443 |
-| `fingerprint.ja4`, `tls.*` | ClientHello fingerprint on 443, dormant until the VM has a certificate |
+| `fingerprint.ja4`, `tls.*` | ClientHello fingerprint on 443, dormant until the VM has a certificate; also a TLS hello on 22/25 when it arrived whole |
+| `proto_mismatch` | `tls`, `http`, `rdp`...: what was spoken on a port that expects something else |
+| `smtp.helo`, `smtp.mail_from`, `smtp.rcpt`, `smtp.auth_user` | lifted from `smtp_commands` |
+| `http.host_foreign`, `threat.proxy_probe` | Host header that is not ours; open-proxy check |
+| `threat.exploit` | named by Vector from the needle table in `vector-sentinel.toml` |
+| `network.rtt_ms`, `network.mss` | kernel TCP_INFO at close; `network.rtt_verdict` added by the enricher |
+| `dropper.urls`, `dropper.hosts` | second-stage locations found in the payload, never fetched |
+| `egress.*` | not a visitor: the VM's own blocked outbound attempts, `classification: egress-blocked` |
 
 SSH passwords are never seen: completing the key exchange needs a host key
 signature and there is no crypto in the standard library. This is a design
@@ -62,7 +75,9 @@ address first touched the sentinel, only when positive).
 payloads" or "Receiver: posted bodies and odd paths"; or panels "Sentinel:
 request lines" and "SSH stacks (HASSH)" on the overview dashboard. From a
 shell on the collector, `campaigns.py --days 7` clusters addresses by
-fingerprint + ports. Never fetch a URL or run a command found in a payload.
+fingerprint + ports. Saved searches "Droppers", "Dropper ledger: first
+seen", "Unlabelled payloads", "SMTP identities" and "Egress attempts" cover
+the rest. Never fetch a URL or run a command found in a payload.
 
 ## Changing things
 
@@ -74,9 +89,13 @@ fingerprint + ports. Never fetch a URL or run a command found in a payload.
   New event fields need a mapping line in `bootstrap-opensearch.sh` (both the
   template and the live-index `_mapping` block) or dynamic mapping makes
   them `keyword` capped at 1024.
-- **Collector** (`enrich.py`, `alerts.py`, `dashboards.py`,
-  `bootstrap-opensearch.sh`): selftests are `python enrich.py --selftest` and
-  `python alerts.py --dump` (dummy env). Copy to `~/tripwire` on the
+- **Vector on the sentinel** (`vector-sentinel.toml`): `./test-vector.sh`
+  runs the real config against fixed events in a container.
+- **Collector** (`enrich.py`, `droppers.py`, `alerts.py`, `dashboards.py`,
+  `bootstrap-opensearch.sh`): selftests are `python enrich.py --selftest`,
+  `python droppers.py --selftest`, `python dashboards.py --selftest` (panels
+  against the mappings) and `python alerts.py --dump` (dummy env). Copy to
+  `~/tripwire` on the
   collector, rerun `./bootstrap-opensearch.sh` (idempotent: mappings,
   policies, dashboards import, monitors), `podman restart
   tripwire-enricher` (bind-mounted, no rebuild). Vector containers need
@@ -89,10 +108,15 @@ fingerprint + ports. Never fetch a URL or run a command found in a payload.
 
 ## Monitors (alerts.py)
 
-canary, agent, both, returned, novel-fingerprint (high channel);
-sentinel-silent 60 min and receiver-silent 30 min dead-man switches; digest
-07:00 `DIGEST_TZ` (low channel). `novel-fingerprint` is noisy for the first
-days after a fresh `fingerprint-book`; that is expected, not a bug.
+canary, agent, both, returned, novel-fingerprint, novel-dropper,
+honeypot-tagged, egress (high channel); sentinel-silent 60 min and
+receiver-silent 30 min dead-man switches; digest 07:00 `DIGEST_TZ` (low
+channel). `novel-fingerprint` and `novel-dropper` are noisy for the first
+days after a fresh book; that is expected, not a bug. `egress` means the VM
+tried to connect out: snapshot from the cloud console, destroy, do not log
+in first. Egress events do not count as sentinel life for the dead-man
+switch. `honeypot-tagged` only exists with `ENRICH_LOOKUPS` naming
+`internetdb` and `SENTINEL_PUBLIC_IP` set.
 
 ## Roadmap
 
@@ -106,4 +130,8 @@ days after a fresh `fingerprint-book`; that is expected, not a bug.
   and bind-mounted into the container. Self-signed is fine for the
   fingerprint itself, but a real cert makes the persona hold up.
 - Optional: GreyNoise / AbuseIPDB keys in the collector `.env` for
-  reputation enrichment.
+  reputation enrichment; `ENRICH_LOOKUPS` for InternetDB / DShield / OTX
+  (each sends visitor addresses to a third party, so off by default).
+- **Apply `harden-sentinel.sh` on the VM.** Deferred until the admin SSH
+  path is decided. The fake VM (`docs/plans/2026-09-19-fake-vm.md`) is gated
+  on the egress block being proven there.
