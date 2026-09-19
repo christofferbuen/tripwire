@@ -1415,6 +1415,145 @@ def _selftest_live() -> None:
     assert any(e.get("http_body") == "username=admin&p=1" for e in events), events
 
 
+# What the server puts on the wire for each probe below, recorded against a
+# known-good build. Everything that is random by design is masked first, so
+# what is left is the part that must never move: the banners, the framing, the
+# replies and their order. A change here is a change a scanner can see, and no
+# work on this file is allowed to produce one. If an edit makes one of these
+# fail, the edit is wrong; the literal is not to be updated to match it.
+
+# Everything port 22 ever says: the identification string and one KEXINIT,
+# whatever the client turned out to be speaking.
+_WIRE_SSH = (
+    b'SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.13\r\n\x00\x00\x04\x1c\n'
+    b'\x14CCCCCCCCCCCCCCCC\x00\x00\x00\xe6curve25519-sha256,curve25519'
+    b'-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sh'
+    b'a2-nistp521,diffie-hellman-group-exchange-sha256,diffie-hellman-'
+    b'group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-grou'
+    b'p14-sha256\x00\x00\x00Arsa-sha2-512,rsa-sha2-256,ssh-rsa,ecdsa-s'
+    b'ha2-nistp256,ssh-ed25519\x00\x00\x00lchacha20-poly1305@openssh.c'
+    b'om,aes128-ctr,aes192-ctr,aes256-ctr,aes128-gcm@openssh.com,aes25'
+    b'6-gcm@openssh.com\x00\x00\x00lchacha20-poly1305@openssh.com,aes1'
+    b'28-ctr,aes192-ctr,aes256-ctr,aes128-gcm@openssh.com,aes256-gcm@o'
+    b'penssh.com\x00\x00\x00\xd5umac-64-etm@openssh.com,umac-128-etm@o'
+    b'penssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@opens'
+    b'sh.com,hmac-sha1-etm@openssh.com,umac-64@openssh.com,umac-128@op'
+    b'enssh.com,hmac-sha2-256,hmac-sha2-512,hmac-sha1\x00\x00\x00\xd5u'
+    b'mac-64-etm@openssh.com,umac-128-etm@openssh.com,hmac-sha2-256-et'
+    b'm@openssh.com,hmac-sha2-512-etm@openssh.com,hmac-sha1-etm@openss'
+    b'h.com,umac-64@openssh.com,umac-128@openssh.com,hmac-sha2-256,hma'
+    b'c-sha2-512,hmac-sha1\x00\x00\x00\x15none,zlib@openssh.com\x00'
+    b'\x00\x00\x15none,zlib@openssh.com\x00\x00\x00\x00\x00\x00\x00'
+    b'\x00\x00\x00\x00\x00\x00PPPPPPPPPP'
+)
+
+# The banner, then one 502 for each line the client turned out to have sent.
+# A ClientHello and an HTTP request both split into three of them.
+_WIRE_SMTP_UNKNOWN = (
+    b'220 mail.example.com ESMTP Postfix (Ubuntu)\r\n502 5.5.2 Error: '
+    b'command not recognized\r\n502 5.5.2 Error: command not recognize'
+    b'd\r\n502 5.5.2 Error: command not recognized\r\n'
+)
+
+WIRE_GOLDEN: dict[str, bytes] = {
+    "W1": _WIRE_SSH,
+    "W2": _WIRE_SSH,
+    "W3": _WIRE_SSH,
+    "W4": _WIRE_SMTP_UNKNOWN,
+    "W5": _WIRE_SMTP_UNKNOWN,
+    "W6": (
+        b'220 mail.example.com ESMTP Postfix (Ubuntu)\r\n250-mail.example.'
+        b'com\r\n250-PIPELINING\r\n250-SIZE 10240000\r\n250-VRFY\r\n250-ET'
+        b'RN\r\n250-STARTTLS\r\n250-ENHANCEDSTATUSCODES\r\n250-8BITMIME\r'
+        b'\n250-DSN\r\n250 CHUNKING\r\n250 2.1.0 Ok\r\n554 5.7.1 <unknown>'
+        b': Relay access denied\r\n503 5.5.1 Error: authentication not ena'
+        b'bled\r\n221 2.0.0 Bye\r\n'
+    ),
+    "W7": (
+        b'HTTP/1.1 404 Not Found\r\nServer: nginx/1.18.0 (Ubuntu)\r\nDate:'
+        b' <masked>\r\nContent-Type: text/html\r\nContent-Length: 162\r\nC'
+        b'onnection: keep-alive\r\n\r\n<html>\r\n<head><title>404 Not Foun'
+        b'd</title></head>\r\n<body>\r\n<center><h1>404 Not Found</h1></ce'
+        b'nter>\r\n<hr><center>nginx/1.18.0 (Ubuntu)</center>\r\n</body>\r'
+        b'\n</html>\r\n'
+    ),
+}
+
+
+def _mask_wire(data: bytes) -> bytes:
+    """Blank the bytes that are meant to differ every connection.
+
+    The SSH cookie and packet padding are fresh per connection and the Date
+    header moves with the clock. Their presence and their length are pinned,
+    their contents cannot be.
+    """
+    head, sep, rest = data.partition(b"\r\n")
+    if sep and len(rest) >= 6 and rest[5] == 20:        # SSH_MSG_KEXINIT
+        size = struct.unpack(">I", rest[:4])[0]
+        pad = rest[4]
+        if 0 < pad < size <= len(rest) - 4:
+            data = (head + sep + rest[:6] + b"C" * 16
+                    + rest[22:4 + size - pad] + b"P" * pad + rest[4 + size:])
+    return re.sub(rb"Date: [^\r\n]*", b"Date: <masked>", data)
+
+
+def _probe(port: int, data: bytes) -> bytes:
+    """Send one thing, stop talking, and keep everything that comes back."""
+    client = None
+    for _ in range(100):
+        with contextlib.suppress(OSError):
+            client = socket.create_connection(("127.0.0.1", port), timeout=30)
+            break
+        time.sleep(0.05)
+    if client is None:
+        raise AssertionError(f"nothing came up on {port}")
+    with client:
+        client.sendall(data)
+        client.shutdown(socket.SHUT_WR)
+        chunks = []
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _wire_transcripts() -> dict[str, bytes]:
+    """Run every probe against a real server and return the masked answers."""
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="sentinel-wiretest-"))
+    threading.Thread(target=main, daemon=True, args=([
+        "--host", "127.0.0.1", "--port-offset", "41000", "--no-hold",
+        "--quiet", "--hostname", "mail.example.com",
+        "--log", str(tmp / "connections.jsonl"),
+        "--identity", str(tmp / "identity.json"),
+    ],)).start()
+
+    probes = (
+        ("W1", 41022, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+        ("W2", 41022, _hello_bytes()),
+        ("W3", 41022, b"\x03\x00\x00\x2f\x2a\xe0\x00\x00\x00\x00\x00"
+                      b"Cookie: mstshash=hello\r\n"),
+        ("W4", 41025, _hello_bytes()),
+        ("W5", 41025, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+        ("W6", 41025, b"EHLO WIN-TEST\r\nMAIL FROM:<a@b.example>\r\n"
+                      b"RCPT TO:<c@d.example>\r\nAUTH LOGIN dXNlcg==\r\n"
+                      b"QUIT\r\n"),
+        ("W7", 41080, b"GET http://judge.example/azenv.php HTTP/1.1\r\n"
+                      b"Host: judge.example\r\n\r\n"),
+    )
+    return {name: _mask_wire(_probe(port, probe)) for name, port, probe in probes}
+
+
+def _selftest_wire() -> None:
+    got = _wire_transcripts()
+    assert sorted(got) == sorted(WIRE_GOLDEN), (sorted(got), sorted(WIRE_GOLDEN))
+    for name, want in WIRE_GOLDEN.items():
+        assert got[name] == want, (
+            f"{name}: the bytes on the wire moved\n"
+            f"  want {ascii(want)}\n  got  {ascii(got[name])}")
+
+
 def selftest() -> int:
     lists = parse_kexinit(ssh_kexinit())
     assert lists is not None
@@ -1466,6 +1605,7 @@ def selftest() -> int:
                               "HTTP/1.1")[0] == "accept,accept"
 
     _selftest_live()
+    _selftest_wire()
     print("selftest ok")
     return 0
 
