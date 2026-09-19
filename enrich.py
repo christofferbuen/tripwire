@@ -737,8 +737,17 @@ class Enricher:
             status, doc = self.os.call("PUT", "/" + name, mapping)
             if status == 200:
                 log.info("created index %s", name)
-            elif status != 400 or "already_exists" not in json.dumps(doc):
+                continue
+            if status != 400 or "already_exists" not in json.dumps(doc):
                 raise RuntimeError(f"cannot create {name}: {status} {doc}")
+            # A book from an older version: creation is the only time the
+            # mapping above is read, so hand it the fields it has not got.
+            # Additive only; a field that already exists with another type
+            # comes back 400, which is worth a line and not worth the pass.
+            status, doc = self.os.call("PUT", f"/{name}/_mapping",
+                                       {"properties": mapping["mappings"]["properties"]})
+            if status != 200:
+                log.warning("cannot update mapping of %s: %s %s", name, status, doc)
 
     def pending(self):
         body = {"size": 0,
@@ -1188,6 +1197,24 @@ def selftest():
     Enricher(os_b, Lists(), Reputation({}), {}).cycle()  # must not raise
     assert os_b.calls > 0
     droppers = orig_droppers
+
+    # 12. A book that already exists gets the new fields through _mapping, and
+    # a refused update does not stop the enricher.
+    class OldBooks:
+        def __init__(self):
+            self.seen = []
+
+        def call(self, method, path, body=None):
+            self.seen.append((method, path, body))
+            if path.endswith("/_mapping"):
+                return 400, {"error": "mapper cannot be changed"}
+            return 400, {"error": {"type": "resource_already_exists_exception"}}
+    old = OldBooks()
+    Enricher(old, Lists(), Reputation({}), {}).ensure_book()  # must not raise
+    updates = {p: b for m, p, b in old.seen if p.endswith("/_mapping")}
+    assert set(updates) == {f"/{BOOK}/_mapping", f"/{FINGERPRINT_BOOK}/_mapping"}, updates
+    assert "honeypot_tagged" in updates[f"/{BOOK}/_mapping"]["properties"]
+    assert "settings" not in updates[f"/{BOOK}/_mapping"]
 
     print("selftest ok")
 
