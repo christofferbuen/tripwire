@@ -44,12 +44,29 @@ trap cleanup EXIT
 # same secrets backend, vector.toml does not, but a spare key in the file is
 # harmless either way. Never real credentials; this file lives only in a
 # temp dir removed when the script exits.
-cat > "$SECRETS_DIR/secrets.json" <<'JSON'
-{
-  "opensearch_password": "dummy-test-password",
-  "opensearch_endpoint": "https://opensearch.invalid:9200"
-}
-JSON
+#
+# The file is rendered by the real setup-logging.sh from a .env with every
+# optional key set, not written by hand: Vector's backend reads the whole
+# file as a map of strings, and one number or list in it fails every lookup.
+# A hand-written file here once let exactly that through to the collector.
+cp "$REPO_DIR/setup-logging.sh" "$SECRETS_DIR/"
+cat > "$SECRETS_DIR/.env" <<'ENV'
+OPENSEARCH_INITIAL_ADMIN_PASSWORD=dummy-test-password
+GREYNOISE_API_KEY=dummy
+ABUSEIPDB_API_KEY=dummy
+OTX_API_KEY=dummy
+SENTINEL_PUBLIC_IP=192.0.2.1
+ENRICH_LOOKUPS=internetdb, dshield, otx
+SENTINEL_LAT=48.86
+SENTINEL_LON=2.35
+ENV
+bash "$SECRETS_DIR/setup-logging.sh" > /dev/null
+python3 - "$SECRETS_DIR" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1] + "/vector-secrets.json"))
+doc["opensearch_endpoint"] = "https://opensearch.invalid:9200"
+json.dump(doc, open(sys.argv[1] + "/secrets.json", "w"))
+PY
 chmod 600 "$SECRETS_DIR/secrets.json"
 
 run_topology() {

@@ -74,6 +74,9 @@ for line in open(env_path, encoding="utf-8"):
 password = env.get("OPENSEARCH_INITIAL_ADMIN_PASSWORD")
 if not password:
     sys.exit(f"OPENSEARCH_INITIAL_ADMIN_PASSWORD is missing from {env_path}")
+# Every value stays a string, numbers and lists included. Vector's file
+# backend reads the whole file as a map of strings and refuses all of it,
+# password too, if one value is anything else. enrich.py converts on read.
 secrets = {"opensearch_password": password}
 # Optional. enrich.py asks GreyNoise and AbuseIPDB about each address when
 # these are present in .env and skips them when they are not.
@@ -86,15 +89,16 @@ for env_key, out_key in (("GREYNOISE_API_KEY", "greynoise_api_key"),
 # internetdb, dshield, otx: each is off unless named here. They send
 # attacker addresses to third parties, so opting in is a line in .env.
 if env.get("ENRICH_LOOKUPS"):
-    secrets["lookups"] = [s.strip() for s in env["ENRICH_LOOKUPS"].split(",") if s.strip()]
+    secrets["lookups"] = env["ENRICH_LOOKUPS"]
 # Sentinel's own coordinates, for the RTT-against-geography verdict. Without
 # both, enrich.py skips that feature and says so once at start-up.
 for env_key, out_key in (("SENTINEL_LAT", "sentinel_lat"), ("SENTINEL_LON", "sentinel_lon")):
     if env.get(env_key):
         try:
-            secrets[out_key] = float(env[env_key])
+            float(env[env_key])
         except ValueError:
             sys.exit(f"{env_key} in {env_path} is not a number: {env[env_key]!r}")
+        secrets[out_key] = env[env_key]
 with open(out_path, "w", encoding="utf-8") as fh:
     json.dump(secrets, fh)
 PY

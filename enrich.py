@@ -441,7 +441,9 @@ class Reputation:
         self.gn_key = secrets.get("greynoise_api_key")
         self.ab_key = secrets.get("abuseipdb_api_key")
         self.otx_key = secrets.get("otx_api_key")
-        self.lookups = set(secrets.get("lookups", []))  # internetdb, dshield, otx: off unless named
+        # internetdb, dshield, otx: off unless named. One comma-separated
+        # string: the file is shared with Vector, which takes strings only.
+        self.lookups = {s.strip() for s in secrets.get("lookups", "").split(",") if s.strip()}
         self.paused = {}  # api -> retry after epoch, set on 429
 
     def _ok(self, name):
@@ -727,8 +729,9 @@ class Enricher:
         # A honeypot sees thousands of distinct stacks, not millions; give it
         # an LRU or a periodic reload from the book if that stops being true.
         self.known_fingerprints = set()
-        self.sentinel_lat = secrets.get("sentinel_lat")
-        self.sentinel_lon = secrets.get("sentinel_lon")
+        # Strings in the file (shared with Vector, strings only), numbers here.
+        self.sentinel_lat = float(secrets["sentinel_lat"]) if secrets.get("sentinel_lat") else None
+        self.sentinel_lon = float(secrets["sentinel_lon"]) if secrets.get("sentinel_lon") else None
         self.sentinel_public_ip = secrets.get("sentinel_public_ip")
         self.audit_next = 0  # next self-audit, epoch seconds; 0 fires on the first pass
 
@@ -1173,6 +1176,10 @@ def selftest():
     assert rep9.otx("192.0.2.1") is None
     assert calls == [], calls
     fetch = orig_fetch
+    # The secrets file is shared with Vector and holds strings only.
+    assert Reputation({"lookups": "internetdb, otx"}).lookups == {"internetdb", "otx"}
+    e9 = Enricher(None, Lists(), rep9, {"sentinel_lat": "48.86", "sentinel_lon": "2.35"})
+    assert (e9.sentinel_lat, e9.sentinel_lon) == (48.86, 2.35)
 
     # 11. droppers is optional at import time and never allowed to break a
     # pass: None is a no-op, and a scan() that raises is swallowed.
