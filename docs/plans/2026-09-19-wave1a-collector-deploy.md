@@ -157,8 +157,14 @@ Optional, by hand in an editor, never through `echo` on a command line:
 
 Then `./setup-logging.sh` (re-renders `vector-secrets.json`, mode 600; it
 does not generate a new password when `.env` has one). Check with
-`python3 -c "import json; print(sorted(json.load(open('vector-secrets.json'))))"`:
-key names only, never values.
+`python3 -c "import json; print({k: type(v).__name__ for k, v in json.load(open('vector-secrets.json')).items()})"`:
+key names and types only, never values. Pass: every type is `str`. Vector
+reads the same file and refuses all of it, password included, if one value
+is a number or a list. The first sitting found that the hard way: the
+coordinates were written as floats, and Vector did not come back in step 6
+until the renderer was fixed (`7395092`; `test-vector.sh` now renders its
+secrets with the real `setup-logging.sh`, so this is caught at the
+workstation).
 
 ### 5. Mappings, dashboards, monitors: first bootstrap
 
@@ -168,8 +174,10 @@ key names only, never values.
 
 Pass: "open indices: mappings updated" (a WARNING line there is the case
 step 1 predicted, and only that), "dropper-book index not there yet ...
-pattern skipped", dashboards import without error, and the monitor for
-`dropper-book` reported as skipped: the index does not exist yet.
+pattern skipped", the dashboards import with exactly one error
+(`missing_references` for `tw-search-ledger`, which needs the `dropper-book`
+pattern; step 8 brings it in), and the monitor for `dropper-book` reported
+as skipped: the index does not exist yet.
 
 ```bash
 osq '/tripwire-sentinel-*/_mapping/field/network.rtt_ms,egress.uid,egress.dst_ip'
@@ -199,9 +207,13 @@ within ten minutes the heartbeat arrives:
 container definition.
 
 ```bash
-podman compose up -d --force-recreate enricher
+podman compose up -d --no-deps --force-recreate enricher
 podman logs -f --since 1m tripwire-enricher
 ```
+
+`--no-deps` fences the command to the one container: compose recreates a
+dependency whose configuration hash has drifted, and the dependency here is
+OpenSearch.
 
 Pass, in the log: no traceback; one `lookups:` line reading
 `internetdb=off (not enabled) dshield=off (not enabled) otx=off (not
@@ -231,15 +243,20 @@ created.
 
 ```bash
 ./bootstrap-opensearch.sh 2>&1 | tee ../bootstrap-wave1a-2.log
-osq '/_plugins/_alerting/monitors/_search?size=50' | python3 -c "import json,sys; print(sorted(h['_source']['name'] for h in json.load(sys.stdin)['hits']['hits']))"
+osq '/_plugins/_alerting/monitors/_search?source_content_type=application/json&source=%7B%22size%22%3A50%2C%22query%22%3A%7B%22exists%22%3A%7B%22field%22%3A%22monitor%22%7D%7D%7D' | python3 -c "import json,sys; print(sorted(h['_source']['name'] for h in json.load(sys.stdin)['hits']['hits']))"
 ```
 
-(`_search` on monitors accepts GET.) Pass: eleven names, among them
+(`_search` on monitors accepts GET, but wants the query, `size` included,
+in the `source` parameter: a bare `?size=50` is a 400.) Pass: eleven names, among them
 `tripwire-egress`, `tripwire-novel-dropper`, `tripwire-honeypot-tagged`.
 
 ### 9. Does the live cluster agree with the code?
 
-Two things could only be checked here.
+Two things could only be checked here. Either in Dashboards as below, or
+without executing a monitor at all: take the query from `alerts.py --dump`,
+replace `{{period_end}}` with `now`, and send it as a GET `_search` with the
+`source` parameter. The first sitting did the latter: `prefix` on `_index`
+is accepted, no shard failed.
 
 - **Digest aggregation.** The dropper count uses a `prefix` query on
   `_index`. In Dashboards: Alerting, Monitors, `tripwire-digest`, Edit,
