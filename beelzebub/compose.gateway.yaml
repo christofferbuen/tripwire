@@ -1,0 +1,17 @@
+# Added only for the private model-backed deployment. No published relay port.
+services:
+  model-gateway:
+    image: docker.io/library/python:3.14.7-alpine3.24
+    container_name: tripwire-model-relay
+    command: [python3, /app/relay.py, --socket, /run/gateway/gateway.sock]
+    networks: [private]
+    volumes:
+      - ./beelzebub/gateway-relay.py:/app/relay.py:ro
+      - /run/tripwire-model-gateway:/run/gateway:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges]
+    mem_limit: 64m
+    pids_limit: 32
+    cpus: 0.25
+    restart: always

@@ -1,0 +1,4 @@
+FROM docker.io/library/alpine:3.24
+RUN apk add --no-cache python3 openssh-client sshpass bash
+COPY client.py stub.py /tests/
+CMD ["python3", "/tests/stub.py"]

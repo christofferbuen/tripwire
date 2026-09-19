@@ -1,0 +1,21 @@
+# Preparation only. Public exposure requires the reviewed containment plan.
+# Render beelzebub/runtime.local.config first; store the provider key only
+# in beelzebub/.env on the VM. Launch with --env-file beelzebub/.env.
+services:
+  fakevm:
+    image: docker.io/m4r10/beelzebub:v3.9.1@sha256:f8e6acbc67a3838a9aa52c0473ac20e04aed8be02e1f131d6188acc0b6ff17f7
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges]
+    mem_limit: 256m
+    pids_limit: 64
+    cpus: 0.5
+    restart: always
+    env_file: [./beelzebub/.env]
+    ports:
+      - "${FAKEVM_BIND:-127.0.0.1}:${FAKEVM_PORT:?set FAKEVM_PORT}:2222"
+    volumes:
+      - ./beelzebub/runtime.local.config:/configurations:ro
+      - /var/log/tripwire-fakevm:/logs:rw

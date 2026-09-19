@@ -247,6 +247,28 @@ the first `--apply`; nothing survives a reboot until `--confirm`.
 
 ## Logging
 
+### Fake SSH preparation
+
+`compose.fakevm.yaml` prepares Beelzebub v3.9.1, pinned by digest, behind
+the optional deploy bait. Local preparation is implemented; it is not
+deployed. It binds to loopback by default. Full hardening and SMTP STARTTLS
+remain deferred; public exposure requires a separately reviewed containment
+step that preserves administrative access. See [the local checks and
+limitations](beelzebub/README.md).
+
+The sentinel's optional `--bait-env FILE` serves exactly `/.env` for
+GET/HEAD on nginx HTTP, recording `bait.served` and token reuse. Without
+the flag the wire bytes are unchanged. Do not include working deploy
+credentials in the served file before the fake SSH service is ready.
+
+The new Vector config ships a whitelist of fields to `tripwire-fakevm-*`
+through its own write alias and disk buffer. Bootstrap supplies closed
+mapping, daily rollover and 30-day retention. Commands and responses are
+searchable text; the session search, address comparison panel and bait-used
+alert show the activity. The digest includes starts and interactions.
+Dropper extraction scans command strings without fetching their contents.
+Upstream session-end records lack an address and are retained by session ID.
+
 `compose.yaml` brings up the receiver, Vector, OpenSearch and Dashboards.
 The receiver writes the same events twice: to SQLite for `analyze.py`, and as
 JSON lines for Vector. Vector never touches the database, so the shipper can

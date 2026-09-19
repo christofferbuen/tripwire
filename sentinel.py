@@ -225,6 +225,8 @@ SSH_MAC = (
 SSH_COMPRESSION = "none,zlib@openssh.com"
 
 READ_LIMIT = 8192
+BAIT_MAX_BYTES = 8192
+BAIT_MIN_TOKEN = 8
 
 # How long each role waits for a client that has connected and said nothing.
 # These are the real daemons' defaults, not round numbers: OpenSSH's
@@ -1008,7 +1010,8 @@ class TlsStream:
 class Sentinel:
     def __init__(self, sink: JsonlSink, persona: dict[str, object],
                  identity: Identity, quiet: bool, hold: bool,
-                 ssl_context: ssl.SSLContext | None = None) -> None:
+                 ssl_context: ssl.SSLContext | None = None,
+                 bait_env: pathlib.Path | None = None) -> None:
         self.sink = sink
         self.persona = persona
         self.identity = identity
@@ -1017,10 +1020,31 @@ class Sentinel:
         self.ssl_context = ssl_context
         self.tracker = Tracker()
         self.open_conns = 0
+        self.bait_body: bytes | None = None
+        self.bait_mtime = 0.0
+        self.bait_tokens: set[str] = set()
+        if bait_env is not None:
+            with bait_env.open("rb") as stream:
+                bait = stream.read(BAIT_MAX_BYTES + 1)
+                self.bait_mtime = os.fstat(stream.fileno()).st_mtime
+            if len(bait) > BAIT_MAX_BYTES:
+                raise ValueError("bait file exceeds 8 KiB")
+            if str(persona["http_server"]).startswith("nginx/"):
+                self.bait_body = bait
+                for line in bait.decode("utf-8", "replace").splitlines():
+                    if line.lstrip().startswith("#"):
+                        continue
+                    key, sep, value = line.partition("=")
+                    value = value.strip().strip("\"'")
+                    if sep and key.strip() and len(value) >= BAIT_MIN_TOKEN:
+                        self.bait_tokens.add(value)
         self.body = (
             APACHE_DEFAULT if "Apache" in str(persona["http_server"])
             else NGINX_DEFAULT
         )
+
+    def bait_hit(self, *texts: str) -> bool:
+        return any(token in text for token in self.bait_tokens for text in texts)
 
     def emit(self, event: dict[str, object]) -> None:
         event.setdefault("persona", self.identity.persona)
@@ -1091,7 +1115,7 @@ class Sentinel:
         # published signature of the well-known SSH tarpits.
 
     async def do_http(self, reader, writer, note: dict[str, object],
-                      port: int, local: str = "") -> None:
+                      port: int, local: str = "", *, allow_bait: bool = True) -> None:
         """Enough HTTP to be an unremarkable web server, including keep-alive."""
         server = str(self.persona["http_server"])
         requests: list[str] = []
@@ -1152,6 +1176,7 @@ class Sentinel:
             # also where the interesting part of a POST lives: the router
             # exploit's command injection, the credentials for the login
             # form. First 4 KiB kept, the rest drained and dropped.
+            body = b""
             try:
                 length = min(int(headers.get("content-length", "0")), 1 << 20)
             except ValueError:
@@ -1165,10 +1190,25 @@ class Sentinel:
                 if body and "http_body" not in note:
                     note["http_body"] = body[:4096].decode("utf-8", "replace")
 
+            basic = ""
+            auth = headers.get("authorization", "")
+            if self.bait_tokens and auth.lower().startswith("basic "):
+                with contextlib.suppress(ValueError):
+                    basic = base64.b64decode(auth[6:], validate=True).decode("utf-8", "replace")
+            if self.bait_hit(request, body[:4096].decode("utf-8", "replace"), basic):
+                note["bait_credential_used"] = True
+
             await self.jitter()
             if method not in ("GET", "HEAD"):
                 writer.write(self.http_response(
                     405, b"", server, extra={"Allow": "GET, HEAD"}, keep=keep))
+            elif allow_bait and self.bait_body is not None and target.split("?", 1)[0] == "/.env":
+                note["bait_served"] = "env"
+                writer.write(self.http_response(
+                    200, self.bait_body, server, head=(method == "HEAD"), keep=keep,
+                    content_type="application/octet-stream",
+                    etag=f'"{int(self.bait_mtime):x}-{len(self.bait_body):x}"',
+                    last_modified=http_date(self.bait_mtime)))
             elif target in ("/", "/index.html", "/index.nginx-debian.html"):
                 writer.write(self.http_response(
                     200, self.body, server, head=(method == "HEAD"),
@@ -1230,7 +1270,7 @@ class Sentinel:
                 return
             incoming.write(chunk)
 
-        await self.do_http(stream, stream, note, port, local_address(writer))
+        await self.do_http(stream, stream, note, port, local_address(writer), allow_bait=False)
 
     def http_404(self, server: str) -> bytes:
         if "Apache" in server:
@@ -1253,13 +1293,14 @@ class Sentinel:
                       head: bool = False, keep: bool = True,
                       etag: str | None = None,
                       last_modified: str | None = None,
+                      content_type: str = "text/html",
                       extra: dict[str, str] | None = None) -> bytes:
         reasons = {200: "OK", 404: "Not Found", 405: "Method Not Allowed"}
         lines = [
             f"HTTP/1.1 {status} {reasons.get(status, 'OK')}",
             f"Server: {server}",
             f"Date: {http_date()}",
-            "Content-Type: text/html",
+            f"Content-Type: {content_type}",
             f"Content-Length: {len(body)}",
             f"Connection: {'keep-alive' if keep else 'close'}",
         ]
@@ -1351,6 +1392,8 @@ class Sentinel:
         if commands:
             note["smtp_commands"] = commands[:24]
             note.update(smtp_identity(commands))
+            if self.bait_hit(str(note.get("smtp_auth_user", ""))):
+                note["bait_credential_used"] = True
         if spoken == "tls":
             # A ClientHello has no line structure; readline() cut it into
             # pieces on whatever bytes happened to be 0x0a, and the pieces
@@ -1973,6 +2016,8 @@ def main(argv: list[str] | None = None) -> int:
                          "certificate minted yesterday is worse than a "
                          "closed port")
     ap.add_argument("--tls-key", default=None)
+    ap.add_argument("--bait-env", type=pathlib.Path, default=None,
+                    help="optional local bait file for nginx GET/HEAD /.env; enable only after the fake SSH service is ready")
     ap.add_argument("--port-offset", type=int, default=0,
                     help="add this to every port. For testing on a machine "
                          "where you cannot bind low ports. Never use it in "
@@ -2031,8 +2076,15 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr, flush=True)
 
     sink = JsonlSink(str(log_path))
-    sentinel = Sentinel(sink, persona, identity, args.quiet, not args.no_hold,
-                        ssl_context)
+    try:
+        sentinel = Sentinel(sink, persona, identity, args.quiet, not args.no_hold,
+                            ssl_context, bait_env=args.bait_env)
+    except (OSError, ValueError):
+        sink.close()
+        print("ERROR: bait file unreadable or over 8 KiB", file=sys.stderr)
+        return 2
+    print("NOTE: HTTP bait " + ("on" if sentinel.bait_body is not None else
+                               "off (no file or non-nginx persona)"), file=sys.stderr)
     try:
         asyncio.run(sentinel.serve(args.host, roles))
     except KeyboardInterrupt:

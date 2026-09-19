@@ -1,5 +1,10 @@
 # Wave 1: overview, field contract, order
 
+Sequencing amendment approved 2026-09-19: see `2026-09-19-beelzebub-first.md`.
+Beelzebub local preparation and HTTP bait now precede full D and SMTP A2.
+Public deployment still needs verified containment. Original ordering below
+is retained for context; the amendment governs current work.
+
 Eight work packages. This file is the index and the shared contract; each
 package has its own plan beside it. Builders read this file and their own
 plan, nothing else is required.

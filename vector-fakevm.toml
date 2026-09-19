@@ -1,0 +1,68 @@
+# Additional config for the sentinel's existing Vector; secret.local and
+# data_dir are declared in vector-sentinel.toml. Never merge engine objects.
+[sources.fakevm]
+type = "file"
+include = ["/var/log/tripwire-fakevm/beelzebub.log"]
+read_from = "beginning"
+max_line_bytes = 262144
+fingerprint.strategy = "checksum"
+fingerprint.lines = 1
+
+[transforms.fakevm_events]
+type = "remap"
+inputs = ["fakevm"]
+drop_on_error = true
+drop_on_abort = true
+source = '''
+parsed = object!(parse_json!(.message))
+e = object!(parsed.event)
+if e.Protocol != "SSH" { abort }
+status = downcase(string!(e.Status))
+if !includes(["start", "end", "stateless", "interaction"], status) { abort }
+session = string!(e.ID)
+if length(session) == 0 || length(session) > 64 { abort }
+ip = string(e.SourceIp) ?? ""
+# Upstream End events omit address and port. Preserve them by session ID;
+# do not invent an address or silently discard the end of every session.
+if !(status == "end" && ip == "") && !is_ipv4(ip) && !is_ipv6(ip) { abort }
+stamp = parse_timestamp(string(e.DateTime) ?? "", format: "%+") ?? now()
+. = {
+  "@timestamp": stamp,
+  "event": {"kind": "event", "dataset": "fakevm", "module": "fakevm"},
+  "fakevm": {
+    "session": session,
+    "status": status,
+    "user": truncate(string(e.User) ?? "", limit: 256),
+    "password": truncate(string(e.Password) ?? "", limit: 256),
+    "client": truncate(string(e.Client) ?? "", limit: 256),
+    "command": truncate(string(e.Command) ?? "", limit: 4096),
+    "output": truncate(string(e.CommandOutput) ?? "", limit: 8192)
+  }
+}
+if ip != "" {
+  .source = {"ip": ip}
+  port = to_int(e.SourcePort) ?? 0
+  if port > 0 && port <= 65535 { .source.port = port }
+}
+if status == "start" { .bait = {"credential_used": true} }
+'''
+
+[sinks.opensearch_fakevm]
+type = "elasticsearch"
+inputs = ["fakevm_events"]
+endpoints = ["SECRET[local.opensearch_endpoint]"]
+api_version = "v7"
+mode = "bulk"
+bulk.index = "tripwire-fakevm"
+auth.strategy = "basic"
+auth.user = "sentinel-writer"
+auth.password = "SECRET[local.opensearch_password]"
+tls.verify_certificate = false
+tls.verify_hostname = false
+acknowledgements.enabled = true
+batch.timeout_secs = 10
+
+[sinks.opensearch_fakevm.buffer]
+type = "disk"
+max_size = 268435488
+when_full = "block"

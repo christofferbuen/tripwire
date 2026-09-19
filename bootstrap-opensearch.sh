@@ -181,7 +181,7 @@ EOF
 echo "  done"
 
 echo "Creating the index template."
-api PUT /_index_template/tripwire "$(cat <<'EOF'
+tripwire_template="$(cat <<'EOF'
 {
   "index_patterns": ["tripwire-hits-*", "tripwire-sentinel-*"],
   "priority": 200,
@@ -218,6 +218,7 @@ api PUT /_index_template/tripwire "$(cat <<'EOF'
         "source": {
           "properties": {
             "ip": { "type": "ip", "ignore_malformed": true },
+            "port": { "type": "integer" },
             "geo": {
               "properties": {
                 "country_iso_code": { "type": "keyword" },
@@ -367,6 +368,17 @@ api PUT /_index_template/tripwire "$(cat <<'EOF'
             "credential_used": { "type": "boolean" }
           }
         },
+        "fakevm": {
+          "properties": {
+            "session": { "type": "keyword", "ignore_above": 64 },
+            "status": { "type": "keyword" },
+            "user": { "type": "keyword", "ignore_above": 256 },
+            "password": { "type": "keyword", "ignore_above": 256 },
+            "client": { "type": "keyword", "ignore_above": 256 },
+            "command": { "type": "text", "fields": { "keyword": { "type": "keyword", "ignore_above": 1024 } } },
+            "output": { "type": "text", "fields": { "keyword": { "type": "keyword", "ignore_above": 1024 } } }
+          }
+        },
         "dropper": {
           "properties": {
             "scanned": { "type": "boolean" },
@@ -421,6 +433,7 @@ api PUT /_index_template/tripwire "$(cat <<'EOF'
 }
 EOF
 )" > /dev/null
+api PUT /_index_template/tripwire "$tripwire_template" > /dev/null
 echo "  done"
 
 # Templates only shape indices created later. Give the ones already open the
@@ -432,6 +445,7 @@ if api GET "/_cat/indices/tripwire-*?h=index" | grep -q tripwire; then
   api PUT "/tripwire-*/_settings" '{"index.default_pipeline":"tripwire-enrich","index.mapping.total_fields.limit":300}' > /dev/null || true
   live_mapping="$(api PUT "/tripwire-*/_mapping" '{"properties":{
     "source":{"properties":{
+      "port":{"type":"integer"},
       "geo":{"properties":{"country_iso_code":{"type":"keyword"},"country_name":{"type":"keyword"},
              "city_name":{"type":"keyword"},"location":{"type":"geo_point","ignore_malformed":true}}},
       "as":{"properties":{"asn":{"type":"keyword"},"organization_name":{"type":"keyword"}}},
@@ -465,6 +479,12 @@ if api GET "/_cat/indices/tripwire-*?h=index" | grep -q tripwire; then
             "auth_user":{"type":"keyword","ignore_above":128},"auth_pass":{"type":"keyword","ignore_above":128},
             "starttls":{"type":"boolean"}}},
     "bait":{"properties":{"served":{"type":"keyword"},"credential_used":{"type":"boolean"}}},
+    "fakevm":{"properties":{
+      "session":{"type":"keyword","ignore_above":64},"status":{"type":"keyword"},
+      "user":{"type":"keyword","ignore_above":256},"password":{"type":"keyword","ignore_above":256},
+      "client":{"type":"keyword","ignore_above":256},
+      "command":{"type":"text","fields":{"keyword":{"type":"keyword","ignore_above":1024}}},
+      "output":{"type":"text","fields":{"keyword":{"type":"keyword","ignore_above":1024}}}}},
     "dropper":{"properties":{"scanned":{"type":"boolean"},"urls":{"type":"keyword","ignore_above":512},
                "hosts":{"type":"keyword","ignore_above":256}}},
     "egress":{"properties":{"dst_ip":{"type":"ip","ignore_malformed":true},"dst_port":{"type":"integer"},
@@ -492,6 +512,46 @@ if ! api GET "/tripwire-sentinel-000001?filter_path=*.settings.index.uuid" | gre
 fi
 echo "  done"
 
+echo "Creating the fake-VM template, retention policy and write alias."
+# Derive shared enrichment mappings from the actual template just installed,
+# not a second partial field list. Close dynamic mapping for model/attacker text.
+fakevm_template="$(printf '%s' "$tripwire_template" | python3 -c '
+import json, sys
+doc = json.load(sys.stdin)
+doc["index_patterns"] = ["tripwire-fakevm-*"]
+doc["priority"] = 210
+mapping = doc["template"]["mappings"]
+mapping["dynamic"] = False
+mapping.pop("dynamic_templates", None)
+doc["template"]["settings"]["plugins.index_state_management.rollover_alias"] = "tripwire-fakevm"
+print(json.dumps(doc))')"
+api PUT /_index_template/tripwire-fakevm "$fakevm_template" > /dev/null
+# Template changes do not reach already-open indices.
+if api GET '/_cat/indices/tripwire-fakevm-*?h=index' | grep -q tripwire-fakevm; then
+  api PUT '/tripwire-fakevm-*/_mapping' "$(printf '%s' "$fakevm_template" | python3 -c '
+import json, sys
+print(json.dumps(json.load(sys.stdin)["template"]["mappings"]))')" > /dev/null
+fi
+api PUT /_plugins/_ism/policies/tripwire-fakevm '{
+  "policy": {
+    "description": "Fake SSH sessions: daily rollover, size cap, 30 day retention.",
+    "default_state": "hot",
+    "ism_template": [{"index_patterns":["tripwire-fakevm-0*"],"priority":120}],
+    "states": [
+      {"name":"hot","actions":[{"rollover":{"min_index_age":"1d"}}],
+       "transitions":[{"state_name":"capped","conditions":{"min_size":"1gb"}},
+                      {"state_name":"delete","conditions":{"min_index_age":"30d"}}]},
+      {"name":"capped","actions":[{"read_only":{}},{"rollover":{"min_index_age":"1d"}}],
+       "transitions":[{"state_name":"delete","conditions":{"min_index_age":"30d"}}]},
+      {"name":"delete","actions":[{"delete":{}}],"transitions":[]}
+    ]
+  }}' > /dev/null
+if ! api GET '/_alias/tripwire-fakevm' | grep -q is_write_index; then
+  api PUT /tripwire-fakevm-000001 '{"aliases":{"tripwire-fakevm":{"is_write_index":true}}}' > /dev/null
+  api POST /_plugins/_ism/add/tripwire-fakevm-000001 '{"policy_id":"tripwire-fakevm"}' > /dev/null
+fi
+echo "  done"
+
 echo "Creating the write-only role for the sentinel."
 # No indices:admin/create and no auto_create: it may write to the alias and
 # to indices that already exist under it, and nothing else. mapping/put is
@@ -499,7 +559,7 @@ echo "Creating the write-only role for the sentinel."
 api PUT /_plugins/_security/api/roles/sentinel-writer '{
   "cluster_permissions": ["cluster:monitor/main","cluster:monitor/health","indices:data/write/bulk*"],
   "index_permissions": [{
-    "index_patterns": ["tripwire-sentinel*"],
+    "index_patterns": ["tripwire-sentinel*", "tripwire-fakevm*"],
     "allowed_actions": ["indices:data/write/index","indices:data/write/bulk*",
                         "indices:admin/mapping/auto_put","indices:admin/mapping/put"]
   }]}' > /dev/null

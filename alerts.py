@@ -175,7 +175,10 @@ DIGEST_AGGS = {"by": {
                                             "format": "0"}}}},
     # Ledger documents carry no event.module, so they land in neither bucket
     # above; their @timestamp is the event that first named the location.
-    "droppers": {"filter": {"prefix": {"_index": "dropper-book"}}}}
+    "droppers": {"filter": {"prefix": {"_index": "dropper-book"}}},
+    "fakevm": {"filter": {"term": {"event.module": "fakevm"}},
+               "aggs": {"starts": {"filter": {"term": {"fakevm.status": "start"}}},
+                        "interactions": {"filter": {"term": {"fakevm.status": "interaction"}}}}}}
 
 DIGEST_MESSAGE = (
     "Last 24 h\n"
@@ -193,17 +196,27 @@ DIGEST_MESSAGE = (
     " wrong protocol: {{mismatch.doc_count}}, RTT at odds with GeoIP: "
     "{{rtt_odd.ips.value}} addresses\n"
     "{{/ctx.results.0.aggregations.by.buckets.sentinel}}"
-    "New dropper locations: {{ctx.results.0.aggregations.droppers.doc_count}}")
+    "New dropper locations: {{ctx.results.0.aggregations.droppers.doc_count}}\n"
+    "Fake VM: {{ctx.results.0.aggregations.fakevm.starts.doc_count}} starts, "
+    "{{ctx.results.0.aggregations.fakevm.interactions.doc_count}} interactions")
 
 
 HITS = ["tripwire-hits-*"]
 SENTINEL = ["tripwire-sentinel-*"]
+FAKEVM = ["tripwire-fakevm-*"]
 FINGERPRINTS = ["fingerprint-book"]
 DROPPERS = ["dropper-book"]
 ADDRESSES = ["address-book"]
 EGRESS = {"term": {"classification": "egress-blocked"}}
 
 MONITORS = [
+    query_monitor(
+        "tripwire-bait-used", FAKEVM, [{"term": {"fakevm.status": "start"}}],
+        "bait credential used", "1",
+        "Bait credential used in the fake SSH service.\n"
+        "{{#ctx.results.0.hits.hits}}"
+        "{{_source.source.ip}} session={{_source.fakevm.session}}\n"
+        "{{/ctx.results.0.hits.hits}}"),
     query_monitor(
         "tripwire-canary", HITS, [{"exists": {"field": "canary"}}],
         "canary presented", "1",
@@ -327,7 +340,7 @@ MONITORS = [
     # dropper-book* rather than the bare name: a wildcard that matches
     # nothing is not an error, a missing index would cost the whole digest.
     query_monitor(
-        "tripwire-digest", HITS + SENTINEL + ["dropper-book*"], [], "daily",
+        "tripwire-digest", HITS + SENTINEL + FAKEVM + ["dropper-book*"], [], "daily",
         "5", DIGEST_MESSAGE,
         minutes=24 * 60, size=0, condition="true", throttle_minutes=0,
         aggs=DIGEST_AGGS, channel_id=DIGEST_CHANNEL_ID,

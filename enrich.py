@@ -47,7 +47,7 @@ except ImportError:
 
 OS_URL = os.environ.get("OPENSEARCH_URL", "https://opensearch:9200")
 SECRETS_FILE = os.environ.get("SECRETS_FILE", "/run/secrets/tripwire.json")
-EVENT_INDICES = "tripwire-hits-*,tripwire-sentinel-*"
+EVENT_INDICES = "tripwire-hits-*,tripwire-sentinel-*,tripwire-fakevm-*"
 SENTINEL_INDICES = "tripwire-sentinel-*"
 BOOK = "address-book"
 FINGERPRINT_BOOK = "fingerprint-book"

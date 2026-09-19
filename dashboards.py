@@ -172,9 +172,14 @@ VISUALISATIONS = [
     table("tw-helo", "SMTP: EHLO names", "smtp.helo", SENTINEL, size=20),
     pie("tw-hosting", "Hosting kind", "source.hosting"),
     timeline("tw-proxy", "Proxy probes", "port", "threat.proxy_probe:true"),
+    table("tw-bait-logins", "Bait fetches and SSH logins by address", "source.ip",
+          "bait.served:* or fakevm.status:start", size=20, split="event.module"),
 ]
 
 SEARCHES = [
+    saved_search("tw-search-fakevm", "Fake VM sessions", "event.module:fakevm",
+                 ["source.ip", "fakevm.session", "fakevm.status", "fakevm.user",
+                  "fakevm.client", "fakevm.command", "fakevm.output", "dropper.hosts"]),
     saved_search("tw-search-receiver", "Receiver hits", RECEIVER,
                  ["source.ip", "source.domain", "source.geo.country_iso_code",
                   "source.as.organization_name", "threat.scanner", "threat.tool",
@@ -239,6 +244,7 @@ LAYOUT = [
     ("tw-rtt", 0, 124, 12, 16),
     ("tw-hosting", 12, 124, 12, 16),
     ("tw-proxy", 24, 124, 24, 16),
+    ("tw-bait-logins", 0, 140, 48, 16),
 ]
 
 

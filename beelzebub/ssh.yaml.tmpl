@@ -1,0 +1,42 @@
+apiVersion: v1
+protocol: ssh
+address: "0.0.0.0:2222"
+description: fakevm
+serverVersion: @@SERVER_VERSION@@
+serverName: @@SERVER_NAME@@
+passwordRegex: @@PASSWORD_REGEX@@
+deadlineTimeoutSeconds: @@DEADLINE@@
+commands:
+  - regex: '^whoami$'
+    handler: deploy
+  - regex: '^id$'
+    handler: 'uid=1001(deploy) gid=1001(deploy) groups=1001(deploy)'
+  - regex: '^hostname$'
+    handler: @@SERVER_NAME@@
+  - regex: '^uname -a$'
+    handler: @@UNAME@@
+  - regex: '^uname -r$'
+    handler: 5.4.0-216-generic
+  - regex: '^cat /etc/os-release$'
+    handler: "NAME=\"Ubuntu\"\nVERSION=\"20.04.6 LTS (Focal Fossa)\"\nID=ubuntu\nID_LIKE=debian\nPRETTY_NAME=\"Ubuntu 20.04.6 LTS\"\nVERSION_ID=\"20.04\"\nVERSION_CODENAME=focal\nUBUNTU_CODENAME=focal"
+  - regex: '^cat /etc/issue$'
+    handler: 'Ubuntu 20.04.6 LTS \n \l'
+  - regex: '^nproc$'
+    handler: '1'
+  - regex: '^echo \$SHELL$'
+    handler: /bin/bash
+  # The engine itself closes on exit. logout is only a static answer.
+  - regex: '^(exit|logout)$'
+    handler: logout
+  - regex: '(?s)^(.+)$'
+    plugin: LLMHoneypot
+plugin:
+  llmProvider: openai
+  llmModel: @@LLM_MODEL@@
+  host: @@LLM_ENDPOINT@@
+  prompt: @@PROMPT@@
+  inputValidationEnabled: false
+  outputValidationEnabled: false
+  rateLimitEnabled: true
+  rateLimitRequests: @@RATE_REQUESTS@@
+  rateLimitWindowSeconds: @@RATE_WINDOW@@
