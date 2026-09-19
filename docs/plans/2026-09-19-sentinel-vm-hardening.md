@@ -71,8 +71,8 @@ Output, policy drop:
 
 1. `ct state established,related accept`; `oif lo accept`. Replies on the
    persona ports are established traffic: the sentinel is unaffected.
-2. `ip daddr COLLECTOR_ENDPOINT udp accept` (the tunnel itself; kernel
-   packets carry no socket uid, so this matches by address).
+2. (Moved to 6b after review, 2026-09-19. Here it let any container uid out
+   to the collector's public address on any UDP port.)
 3. `meta skuid PODMAN_UID oifname WG_IFACE ip daddr COLLECTOR_WG tcp dport 9200 accept`
    (Vector shipping; rootless bridged traffic leaves through the user's own
    network helper, so it carries the podman user's uid).
@@ -85,10 +85,18 @@ Output, policy drop:
    ct state new` → `limit rate 30/minute log prefix "tripwire-egress " flags
    skuid`, then an unconditional `counter drop`. The drop is never behind the
    rate limit.
+6b. `ip daddr COLLECTOR_ENDPOINT udp sport WG_LISTEN_PORT accept` (plain
+   `meta l4proto udp` when the port key is empty). The tunnel itself: kernel
+   packets carry no socket uid, so they never matched rule 6 and arrive here,
+   while a container uid was already dropped above. `sport`, not `dport`:
+   the env names this host's listen port, the peer's port has no key.
 7. `meta skuid 0-999`: `udp dport { 53, 123 }`, `tcp dport { 53, 80, 443 }`
    accept (resolver, time, apt, later certificate renewal).
 8. ICMP and ICMPv6 out: accept.
-9. Everything else: `log prefix "tripwire-egress-other "` rate-limited, drop.
+9. Everything else: `ct state new` + `log prefix "tripwire-egress-other "`
+   rate-limited, then an unconditional drop. `ct state new` because a late
+   FIN or RST after conntrack expiry is an ownerless invalid packet and would
+   be logged as the VM reaching out to the scanner.
 
 Forward: policy drop.
 

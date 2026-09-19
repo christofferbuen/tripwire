@@ -132,6 +132,7 @@ services:
         condition: service_healthy
     volumes:
       - ./enrich.py:/app/enrich.py:ro,Z
+      - ./droppers.py:/app/droppers.py:ro,Z
       # Same file Vector reads: the admin password, plus the API keys when
       # ./setup-logging.sh found them in .env.
       - ./vector-secrets.json:/run/secrets/tripwire.json:ro,Z
