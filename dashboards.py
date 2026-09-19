@@ -298,6 +298,9 @@ def selftest():
     here = os.path.dirname(os.path.abspath(__file__))
     with open(os.path.join(here, "bootstrap-opensearch.sh"), encoding="utf-8") as fh:
         script = fh.read()
+    # The admin password reaches curl through creds() and --config. A -u with
+    # a password after it is argv, which every user on the host can read.
+    assert not re.search(r"""-u\s+["']?admin:""", script), "password on a curl command line"
     template = mapped_fields(
         re.search(r'"mappings": (\{.*?\n    \})\n', script, re.S).group(1))
     live = mapped_fields(

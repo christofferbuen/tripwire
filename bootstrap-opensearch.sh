@@ -41,15 +41,23 @@ export OS_PASS="$OPENSEARCH_INITIAL_ADMIN_PASSWORD"
 # Follows the bind address compose.yaml publishes 9200 on.
 OS_URL="${OS_URL:-https://${ADMIN_BIND:-127.0.0.1}:9200}"
 
+# curl gets the password as a config file on a descriptor, never as -u: argv
+# can be read by every user on the host for as long as the process lives.
+# printf is a builtin, so it has no argv of its own. Backslash and double
+# quote are the two characters curl's config syntax wants escaped.
+creds() {
+  local p=${OS_PASS//\\/\\\\}
+  printf 'user = "admin:%s"\n' "${p//\"/\\\"}"
+}
+
 # -k because the cluster uses the self-signed demo certificates and is
-# reachable on loopback only. --netrc-file /dev/null keeps curl from picking
-# up credentials from anywhere else.
+# reachable on loopback only.
 api() {
   local method="$1" path="$2" body="${3:-}"
   local args=(-sS -k -X "$method" "${OS_URL}${path}"
-              -u "admin:${OS_PASS}" -H 'Content-Type: application/json')
+              -H 'Content-Type: application/json')
   [[ -n "$body" ]] && args+=(-d "$body")
-  curl "${args[@]}"
+  curl --config <(creds) "${args[@]}"
 }
 
 echo "Waiting for the cluster."
@@ -508,7 +516,7 @@ echo "Creating the Dashboards index pattern."
 # auth into the caller's private tenant, which a browser session never sees.
 DASH_URL="${DASH_URL:-http://${ADMIN_BIND:-127.0.0.1}:5601}"
 dash() {
-  curl -sS -X "$1" "${DASH_URL}$2" -u "admin:${OS_PASS}" \
+  curl --config <(creds) -sS -X "$1" "${DASH_URL}$2" \
     -H 'osd-xsrf: true' -H 'Content-Type: application/json' -H 'securitytenant: global' -d "$3"
 }
 # With its field list filled in. A pattern saved without one has an empty
@@ -516,7 +524,7 @@ dash() {
 # index-pattern-field (id: @timestamp)" until somebody presses refresh.
 pattern_doc() {  # $1 index pattern, $2 time field
   curl -sS "${DASH_URL}/api/index_patterns/_fields_for_wildcard?pattern=$1&meta_fields=_source&meta_fields=_id&meta_fields=_index&meta_fields=_score" \
-    -u "admin:${OS_PASS}" -H 'securitytenant: global' \
+    --config <(creds) -H 'securitytenant: global' \
     | python3 -c 'import sys, json
 fields = json.dumps(json.load(sys.stdin)["fields"])
 print(json.dumps({"attributes": {"title": sys.argv[1], "timeFieldName": sys.argv[2], "fields": fields}}))' "$1" "$2"
@@ -546,7 +554,7 @@ fi
 echo "Importing the overview dashboard."
 python3 "$(dirname "$0")/dashboards.py" > /tmp/tripwire-dashboards.ndjson
 curl -sS -X POST "${DASH_URL}/api/saved_objects/_import?overwrite=true" \
-  -u "admin:${OS_PASS}" -H 'osd-xsrf: true' -H 'securitytenant: global' \
+  --config <(creds) -H 'osd-xsrf: true' -H 'securitytenant: global' \
   -F file=@/tmp/tripwire-dashboards.ndjson \
   | python3 -c 'import sys, json; d = json.load(sys.stdin); print("  imported", d.get("successCount"), "objects", "" if d.get("success") else d)'
 rm -f /tmp/tripwire-dashboards.ndjson
@@ -571,9 +579,10 @@ echo
 echo
 cat <<EOF
 Template and policy are in place. They apply to indices created from now on,
-so if Vector already wrote today's index, delete it and let it be recreated:
+so if Vector already wrote today's index, delete it and let it be recreated
+(curl asks for the password, which is in .env; do not put it on the line):
 
-  curl -sk -u admin:\$OPENSEARCH_INITIAL_ADMIN_PASSWORD \\
+  curl -sk -u admin \\
     -X DELETE "${OS_URL}/tripwire-hits-*,tripwire-sentinel-*"
 
 Retention is ${RETENTION_DAYS} days. Set RETENTION_DAYS and re-run to change
