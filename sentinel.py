@@ -243,10 +243,24 @@ TIMEOUTS = {
     "other": 30.0,
 }
 
+# A ceiling on the whole handler, above every legitimate wait it makes
+# internally (banner grace, keep-alive, DATA idle). These are backstops, not
+# protocol values in their own right: a client still being served at 900s
+# into an SMTP session is not slow, it is holding the sensor open.
+DEADLINES = {
+    "ssh": 250.0,     # two 120 s waits plus slack
+    "http": 600.0,
+    "https": 600.0,
+    "smtp": 900.0,
+    "mysql": 60.0,
+    "other": 120.0,
+}
+
 SWEEP_PORTS = 3            # distinct ports before an address counts as sweeping
 SWEEP_WINDOW = 600.0       # seconds of history behind that count
 MAX_HOLD = 240.0           # seconds any single connection is held
 MAX_CONCURRENT = 512
+MAX_PER_ADDRESS = 32       # concurrent connections from one address
 FORGET = 3600.0
 
 # Never held, whatever the client has been doing. Somebody might be reading
@@ -1020,6 +1034,7 @@ class Sentinel:
         self.ssl_context = ssl_context
         self.tracker = Tracker()
         self.open_conns = 0
+        self.per_address: dict[str, int] = {}
         self.bait_body: bytes | None = None
         self.bait_mtime = 0.0
         self.bait_tokens: set[str] = set()
@@ -1176,17 +1191,34 @@ class Sentinel:
             # also where the interesting part of a POST lives: the router
             # exploit's command injection, the credentials for the login
             # form. First 4 KiB kept, the rest drained and dropped.
+            #
+            # Read in chunks rather than one readexactly(length): 512
+            # connections x 1 MiB against mem_limit: 256m is an OOM kill, and
+            # TlsStream (443) has no readexactly, so the old call silently
+            # failed there instead. Peak memory per connection is now
+            # READ_LIMIT plus the 4 KiB kept.
             body = b""
             try:
                 length = min(int(headers.get("content-length", "0")), 1 << 20)
             except ValueError:
                 length = 0
             if length:
-                body = b""
+                kept, got = b"", 0
+                deadline = time.monotonic() + TIMEOUTS["http_header"]
                 with contextlib.suppress(Exception):
-                    body = await asyncio.wait_for(
-                        reader.readexactly(length), timeout=TIMEOUTS["http_header"])
-                note["bytes_received"] = note.get("bytes_received", 0) + len(body)
+                    while got < length:
+                        left = deadline - time.monotonic()
+                        if left <= 0:
+                            break
+                        chunk = await asyncio.wait_for(
+                            reader.read(min(READ_LIMIT, length - got)), timeout=left)
+                        if not chunk:
+                            break
+                        got += len(chunk)
+                        if len(kept) < 4096:
+                            kept += chunk[:4096 - len(kept)]
+                body = kept
+                note["bytes_received"] = note.get("bytes_received", 0) + got
                 if body and "http_body" not in note:
                     note["http_body"] = body[:4096].decode("utf-8", "replace")
 
@@ -1452,6 +1484,7 @@ class Sentinel:
         early = sample_tcp_info(writer)
 
         self.open_conns += 1
+        self.per_address[ip] = self.per_address.get(ip, 0) + 1
         try:
             if self.open_conns > MAX_CONCURRENT:
                 # Out of capacity. A sensor that falls over during a scan
@@ -1459,6 +1492,14 @@ class Sentinel:
                 # die. A real server under load resets connections too.
                 self.emit({"ts": now_iso(), "kind": "connect", "port": port,
                            "ip": ip, "role": role, "outcome": "shed-load"})
+                return
+
+            if self.per_address[ip] > MAX_PER_ADDRESS:
+                # Same shedding, scoped to one address: a single source
+                # opening hundreds of sockets should not have to fill the
+                # whole sensor's capacity before anything pushes back.
+                self.emit({"ts": now_iso(), "kind": "connect", "port": port,
+                           "ip": ip, "role": role, "outcome": "shed-address"})
                 return
 
             distinct, first_contact, newly_sweeping = self.tracker.note(ip, port)
@@ -1477,16 +1518,24 @@ class Sentinel:
                 "smtp": self.do_smtp,
                 "mysql": self.do_mysql,
             }.get(role)
+            if role == "https":
+                coro = self.do_https(reader, writer, note, port)
+            elif role == "http":
+                coro = self.do_http(reader, writer, note, port, local_address(writer))
+            elif handler is not None:
+                coro = handler(reader, writer, note)
+            else:
+                coro = self.do_silent(reader, writer, note)
+
             with contextlib.suppress(Exception):
-                if role == "https":
-                    await self.do_https(reader, writer, note, port)
-                elif role == "http":
-                    await self.do_http(reader, writer, note, port,
-                                       local_address(writer))
-                elif handler is not None:
-                    await handler(reader, writer, note)
-                else:
-                    await self.do_silent(reader, writer, note)
+                try:
+                    await asyncio.wait_for(
+                        coro, timeout=DEADLINES.get(role, DEADLINES["other"]))
+                except asyncio.TimeoutError:
+                    # note was mutated in place by whatever ran before the
+                    # deadline fired, so what the client said up to then
+                    # is kept.
+                    note["outcome"] = "deadline"
 
             hold = hold_seconds(distinct, first_contact, role) if self.hold_enabled else 0.0
             if hold:
@@ -1527,6 +1576,9 @@ class Sentinel:
             self.emit(event)
         finally:
             self.open_conns -= 1
+            self.per_address[ip] -= 1
+            if self.per_address[ip] <= 0:
+                del self.per_address[ip]
             with contextlib.suppress(Exception):
                 writer.close()
                 await writer.wait_closed()
@@ -1900,6 +1952,118 @@ def _selftest_wire() -> None:
             f"  want {ascii(want)}\n  got  {ascii(got[name])}")
 
 
+def _selftest_bounds() -> None:
+    """2026-09-20: the body-size, per-address and total-deadline backstops.
+
+    A fresh Sentinel on its own port range, so this does not interact with
+    the persona _selftest_live() and _selftest_wire() already have running.
+    """
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="sentinel-selftest-bounds-"))
+    log = tmp / "connections.jsonl"
+    sink = JsonlSink(str(log))
+    identity = Identity(tmp / "identity.json", "ubuntu-web", "mail.example.com")
+    persona = PERSONAS["ubuntu-web"]
+    sentinel = Sentinel(sink, persona, identity, True, False)
+    roles = {port + 42000: role
+             for port, role in dict(persona["roles"]).items()}  # type: ignore[arg-type]
+    threading.Thread(
+        target=lambda: asyncio.run(sentinel.serve("127.0.0.1", roles)),
+        daemon=True).start()
+
+    def connect(port: int) -> socket.socket:
+        for _ in range(100):
+            with contextlib.suppress(OSError):
+                return socket.create_connection(("127.0.0.1", port), timeout=5)
+            time.sleep(0.05)
+        raise AssertionError(f"nothing came up on {port}")
+
+    def load_events() -> list[dict]:
+        if not log.exists():
+            return []
+        return [json.loads(line) for line
+                in log.read_text(encoding="utf-8").splitlines() if line]
+
+    def wait_for(pred, why: str) -> dict:
+        for _ in range(100):
+            for event in load_events():
+                if pred(event):
+                    return event
+            time.sleep(0.05)
+        raise AssertionError(f"no event {why} among {ascii(str(load_events()))}")
+
+    http_port, ssh_port = 42080, 42022
+
+    # 1. A 1 MiB body must not change what a well-behaved client gets back,
+    # and bytes_received must count everything read, not just the 4 KiB kept.
+    def post(body: bytes) -> bytes:
+        client = connect(http_port)
+        with client:
+            client.sendall(
+                b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: "
+                + str(len(body)).encode() + b"\r\n\r\n" + body)
+            return client.recv(65536)
+
+    big = post(b"A=1&" + b"x" * (1048576 - 4))
+    small = post(b"0123456789")
+    assert _mask_wire(big) == _mask_wire(small), (big, small)
+
+    big_event = wait_for(lambda e: str(e.get("http_body", "")).startswith("A=1&"),
+                         "for the 1 MiB POST body")
+    assert big_event["http_body"] == "A=1&" + "x" * 4092, len(big_event["http_body"])
+    assert big_event["bytes_received"] >= 1048576, big_event["bytes_received"]
+
+    # 2. A declared length the client never delivers: read what arrived, no
+    # exception, still an event.
+    client = connect(http_port)
+    with client:
+        client.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100"
+                       b"\r\n\r\n0123456789")
+        client.shutdown(socket.SHUT_WR)
+        with contextlib.suppress(OSError):
+            while client.recv(65536):
+                pass
+    wait_for(lambda e: e.get("http_body") == "0123456789", "for the short body")
+
+    # 3. Per-address cap: patched down so three sockets, not thirty-three,
+    # prove it. The third gets shed before the SSH handler runs at all.
+    global MAX_PER_ADDRESS
+    saved_cap = MAX_PER_ADDRESS
+    MAX_PER_ADDRESS = 2
+    try:
+        a, b = connect(ssh_port), connect(ssh_port)
+        time.sleep(0.1)          # let both handlers register before the third
+        c = connect(ssh_port)
+        assert c.recv(4096) == b"", "the third connection got bytes"
+        a.close()
+        b.close()
+        c.close()
+        for _ in range(100):
+            if not sentinel.per_address:
+                break
+            time.sleep(0.05)
+        assert sentinel.per_address == {}, sentinel.per_address
+    finally:
+        MAX_PER_ADDRESS = saved_cap
+    wait_for(lambda e: e.get("outcome") == "shed-address", "for the shed address")
+
+    # 4. Total deadline: a client that says nothing must not hold the
+    # handler past the per-role backstop, whatever any inner timeout allows.
+    saved_deadline = DEADLINES["ssh"]
+    DEADLINES["ssh"] = 0.2
+    try:
+        started = time.monotonic()
+        client = connect(ssh_port)
+        with client:
+            client.recv(4096)                # the banner, sent before the deadline
+            with contextlib.suppress(OSError):
+                client.recv(4096)            # the deadline fires, then EOF
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0, elapsed
+    finally:
+        DEADLINES["ssh"] = saved_deadline
+    wait_for(lambda e: e.get("outcome") == "deadline", "for the deadline")
+
+
 def selftest() -> int:
     lists = parse_kexinit(ssh_kexinit())
     assert lists is not None
@@ -1987,6 +2151,7 @@ def selftest() -> int:
 
     _selftest_live()
     _selftest_wire()
+    _selftest_bounds()
     print("selftest ok")
     return 0
 

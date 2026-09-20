@@ -967,6 +967,14 @@ class Enricher:
         self.os.call("PUT", f"/{BOOK}/_doc/self", entry)
         log.info("self-audit: tags=%s ports=%s", tags, ports)
 
+    def lookup_safe(self, ip_text):
+        """One address failing must not cost the others their pass."""
+        try:
+            return self.lookup(ip_text)
+        except Exception as e:
+            log.warning("lookup failed for %s: %s", ascii(ip_text), e)
+            return None
+
     def cycle(self):
         self.fingerprints()
         self.self_audit()
@@ -983,7 +991,7 @@ class Enricher:
         if not ips:
             return
         with ThreadPoolExecutor(max_workers=8) as pool:
-            entries = [e for e in pool.map(self.lookup, ips) if e]
+            entries = [e for e in pool.map(self.lookup_safe, ips) if e]
         updated = sum(self.apply(e) for e in entries)
         log.info("pass: %d addresses, %d events updated", len(entries), updated)
 
@@ -1222,6 +1230,25 @@ def selftest():
     assert set(updates) == {f"/{BOOK}/_mapping", f"/{FINGERPRINT_BOOK}/_mapping"}, updates
     assert "honeypot_tagged" in updates[f"/{BOOK}/_mapping"]["properties"]
     assert "settings" not in updates[f"/{BOOK}/_mapping"]
+
+    # 13. One failed lookup must not abort the pass. The enricher's lookup
+    # is replaced with a test function that fails for one address and succeeds
+    # for two others, to verify lookup_safe catches exceptions and the pass
+    # continues.
+    class StubOS:
+        def call(self, method, path, body=None):
+            return 200, {}
+    enricher13 = Enricher(StubOS(), Lists(), Reputation({}), {})
+    def lookup_raises(ip_text):
+        if ip_text == "10.0.0.2":
+            raise OSError("network error")
+        return {"ip": ip_text}
+    enricher13.lookup = lookup_raises
+    test_ips = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [e for e in pool.map(enricher13.lookup_safe, test_ips) if e]
+    assert len(results) == 2, results
+    assert {r["ip"] for r in results} == {"10.0.0.1", "10.0.0.3"}, results
 
     print("selftest ok")
 

@@ -222,6 +222,10 @@ func (s *virtualShell) put(p string, n virtualNode) error {
 	return nil
 }
 
+// A single exec line may build at most this much output before anything
+// downstream (session.go, the SSH transport) gets a chance to trim it.
+const maxOutput = 65536
+
 func (s *virtualShell) builtin(args []string) (string, int, bool) {
 	if len(args) == 0 {
 		return "", 0, true
@@ -350,6 +354,13 @@ func (s *virtualShell) builtin(args []string) (string, int, bool) {
 			}
 			if n.Dir {
 				return fail(arg + ": Is a directory")
+			}
+			// Cut the file that would cross the bound rather than building the
+			// full concatenation first; a chain of small files is otherwise
+			// unbounded before anything trims it.
+			if out.Len()+len(n.Data) > maxOutput {
+				out.WriteString(n.Data[:maxOutput-out.Len()])
+				return out.String(), 0, true
 			}
 			out.WriteString(n.Data)
 		}
@@ -575,8 +586,15 @@ func (s *virtualShell) run(input string, fallback func(string) (string, int)) (s
 		status = code
 		s.Status = status
 		separator = next
-		if out.Len() > 8192 {
-			return "bash: output limit exceeded\n", 1
+		// A chain of separate commands must not add up past the bound either,
+		// or "cat a a a a; cat a a a a; ..." gets around the per-command cut
+		// above. Stop here, as a closed terminal would.
+		if out.Len() >= maxOutput {
+			result := out.String()
+			if len(result) > maxOutput {
+				result = result[:maxOutput]
+			}
+			return result, status
 		}
 	}
 	s.Status = status

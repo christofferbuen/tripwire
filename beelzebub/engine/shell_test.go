@@ -74,6 +74,51 @@ func TestVirtualBoundsAndNoExecution(t *testing.T) {
 	}
 }
 
+func TestVirtualCatOutputBounded(t *testing.T) {
+	s := newVirtualShell("deploy", "web01")
+	fallback := func(string) (string, int) { t.Fatal("unexpected provider call"); return "", 1 }
+	payload := strings.Repeat("x", 16000)
+	if _, code := s.run("printf '%s' "+payload+" > f", fallback); code != 0 {
+		t.Fatal("setup: could not write file")
+	}
+	prefix, unit := "cat", " f"
+	count := (16384 - len(prefix)) / len(unit)
+	out, code := s.run(prefix+strings.Repeat(unit, count), fallback)
+	if len(out) > maxOutput {
+		t.Fatalf("cat chain produced %d bytes, want <= %d", len(out), maxOutput)
+	}
+	if code != 0 {
+		t.Fatalf("truncated cat should still report success, got status %d", code)
+	}
+}
+
+func TestVirtualChainOutputBounded(t *testing.T) {
+	s := newVirtualShell("deploy", "web01")
+	fallback := func(string) (string, int) { t.Fatal("unexpected provider call"); return "", 1 }
+	payload := strings.Repeat("x", 16000)
+	if _, code := s.run("printf '%s' "+payload+" > f", fallback); code != 0 {
+		t.Fatal("setup: could not write file")
+	}
+	unit := "cat f f f f;"
+	count := 16384 / len(unit)
+	out, _ := s.run(strings.Repeat(unit, count), fallback)
+	if len(out) > maxOutput {
+		t.Fatalf("chained cats produced %d bytes, want <= %d", len(out), maxOutput)
+	}
+}
+
+func TestVirtualCatSmallUnchanged(t *testing.T) {
+	s := newVirtualShell("deploy", "web01")
+	fallback := func(string) (string, int) { t.Fatal("unexpected provider call"); return "", 1 }
+	if _, code := s.run("printf '%s' hello > a; printf '%s' world > b", fallback); code != 0 {
+		t.Fatal("setup: could not write files")
+	}
+	out, code := s.run("cat a b", fallback)
+	if out != "helloworld" || code != 0 {
+		t.Fatalf("cat a b => %q,%d; expected %q,0", out, code, "helloworld")
+	}
+}
+
 func TestTripwireHistoryAndTerminal(t *testing.T) {
 	var history []plugin.Message
 	for i := 0; i < 1000; i++ {
