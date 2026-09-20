@@ -17,6 +17,9 @@ identity.json
 *.key
 *.pem
 *.pub
+# ./harden-opensearch.sh --render writes the cluster's CA, its keys and the
+# hashed internal users here. It is mode 700 and belongs to one host.
+opensearch-config/
 # test-vector.sh renders throwaway secrets into a temp directory here and
 # removes it on exit; this is for the run that was killed half way.
 .vector-test-secrets.*

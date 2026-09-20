@@ -43,6 +43,26 @@ PY
   echo "The password is in that file and was not printed here."
 fi
 
+# Dashboards logs in to OpenSearch with its own service account, and compose
+# refuses to start it without this key. Appended rather than written with the
+# block above, because an .env that predates harden-opensearch.sh will not
+# have it and is otherwise left alone. Never regenerated: a running cluster
+# already knows the password it was given, and only
+# `./harden-opensearch.sh --apply-users` can tell it a new one.
+python3 - "$ENV_FILE" <<'PY'
+import secrets, string, sys
+path, key = sys.argv[1], "DASHBOARDS_SERVICE_PASSWORD"
+with open(path) as fh:
+    text = fh.read()
+if any(line.startswith(key + "=") for line in text.splitlines()):
+    sys.exit(0)
+alphabet = string.ascii_letters + string.digits
+pw = "".join(secrets.choice(alphabet) for _ in range(40)) + "_Aa1!"
+with open(path, "a") as fh:
+    fh.write(("" if text.endswith("\n") or not text else "\n") + f"{key}={pw}\n")
+print(f"Added {key} to {path}. It was not printed here.")
+PY
+
 # Vector cannot read .env, and since 0.57 it does not interpolate ${VAR} in
 # its configuration either, so the password reaches it through a secrets
 # file. Regenerated from .env on every run, which keeps the two in step if

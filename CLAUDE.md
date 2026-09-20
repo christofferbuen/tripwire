@@ -101,6 +101,19 @@ the rest. Never fetch a URL or run a command found in a payload.
   policies, dashboards import, monitors), `podman restart
   tripwire-enricher` (bind-mounted, no rebuild). Vector containers need
   stop/start, not restart, under rootless podman.
+- **OpenSearch security** (`harden-opensearch.sh`, `opensearch-config/` on
+  the collector, never in the repo): the node runs on its own CA, node and
+  admin certificates and its own `opensearch.yml`; no demo user, no demo
+  certificate. `--check` is read-only and safe any time; `--render` never
+  overwrites a key (there is no rotate: move the directory aside);
+  `--apply-users` is for a security index that predates the render.
+  `--selftest` needs nothing; `./test-opensearch-hardening.sh` runs fresh
+  install, migration, rollback and idempotence on local podman (about nine
+  minutes). After `--apply-users` the old compose file no longer brings
+  Dashboards up (its service password changed): fix forward. The rendered
+  files belong to the container's uid, so the operator cannot read them;
+  reserved security entries are reached with the admin certificate through
+  `podman exec`, as the script does.
 - Files copied from Windows carry CRLF: `sed -i 's/\r$//'` after every scp.
 - Secrets only in `.env` / `*-secrets.json` on the hosts, never in the repo
   or on a command line.
