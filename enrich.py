@@ -62,6 +62,13 @@ RECHECK = 7 * 86400        # re-resolve and re-query an address after this long
 LIST_REFRESH = 24 * 3600   # the sources themselves update between 10 min and 1 day
 LOOKBACK = "now-3d"        # older events are left alone; ISM may have frozen them
 BATCH = 200                # addresses per pass
+# Long enough to cover an enricher outage (a restart, a backlog), short
+# enough that the scan cost does not grow with the index.
+FINGERPRINT_SCAN = "now-6h"
+FINGERPRINT_PAGES = 20     # composite pages per kind per pass; more than this
+                           # in six hours is a flood, the volume monitor's job
+MAX_NEW_HTTP_PER_PASS = 50 # fingerprint.http's value space is client-chosen
+                           # and unbounded; hassh and ja4 are never capped
 
 # Published lists. Any token on a line that parses as an address or network
 # counts and the rest of the line is ignored, so nft `define` blocks, plain
@@ -672,6 +679,9 @@ FINGERPRINT_MAPPING = {
             "@timestamp": {"type": "date"}, "kind": {"type": "keyword"},
             "value": {"type": "keyword"}, "first_ip": {"type": "keyword"},
             "tool": {"type": "keyword"}, "ssh_client": {"type": "keyword"},
+            # When the book learned this value, stamped by the pass that
+            "recorded": {"type": "date"},
+            # created the entry. @timestamp keeps meaning first sighting.
         },
     },
 }
@@ -767,20 +777,25 @@ class Enricher:
         """Earliest event of this address per producer. One cheap aggregation
         with no lookback, so it runs on every pass: an address that scanned the
         sentinel months ago and shows up on the site today has to be caught the
-        moment it does, not whenever its cache entry next expires."""
+        moment it does, not whenever its cache entry next expires. Keyed on
+        which index wrote the hit, not on event.module: that field is
+        sender-filled, and the sentinel's writer account has no scope to put
+        anything in tripwire-hits-* regardless of what it claims."""
         body = {"size": 0,
                 "query": {"bool": {"filter": [{"term": {"source.ip": ip_text}}]}},
-                "aggs": {"modules": {"terms": {"field": "event.module", "size": 5},
-                                     "aggs": {"first": {"min": {"field": "@timestamp"}}}}}}
+                "aggs": {"producer": {"filters": {"filters": {
+                    "sentinel": {"prefix": {"_index": "tripwire-sentinel-"}},
+                    "receiver": {"prefix": {"_index": "tripwire-hits-"}}}},
+                    "aggs": {"first": {"min": {"field": "@timestamp"}}}}}}
         status, doc = self.os.call("POST", f"/{EVENT_INDICES}/_search?ignore_unavailable=true", body)
         if status != 200:
             log.warning("first-seen %s: %s %s", ip_text, status, doc)
             return {}
         out = {}
-        for bucket in doc.get("aggregations", {}).get("modules", {}).get("buckets", []):
+        for key, bucket in doc.get("aggregations", {}).get("producer", {}).get("buckets", {}).items():
             stamp = bucket.get("first", {}).get("value_as_string")
-            if stamp and bucket["key"] in ("sentinel", "receiver"):
-                out["first_seen_" + bucket["key"]] = stamp
+            if stamp:
+                out["first_seen_" + key] = stamp
         return out
 
     def network(self, ip_text):
@@ -908,45 +923,77 @@ class Enricher:
     def fingerprints(self):
         """Fill the fingerprint book from the sentinel indices. Every document
         is written with _create, so the first sighting is never overwritten and
-        @timestamp keeps meaning "the first time this stack knocked"."""
+        @timestamp keeps meaning "the first time this stack knocked". A
+        composite aggregation pages through every distinct value instead of a
+        terms aggregation's top 1000: new values are the rarest, so a
+        frequency cutoff throws away exactly the ones this book exists to
+        catch. The first pass after start runs over all time to fill a fresh
+        or restored book once; every pass after that only scans FINGERPRINT_SCAN
+        back, since the book already knows anything older."""
+        first_pass = not self.known_fingerprints
         for kind, field in FINGERPRINT_FIELDS.items():
-            body = {"size": 0,
-                    "query": {"bool": {"filter": [{"exists": {"field": field}}]}},
-                    "aggs": {"values": {
-                        "terms": {"field": field, "size": 1000},
-                        "aggs": {"first": {"min": {"field": "@timestamp"}},
-                                 "earliest": {"top_hits": {
-                                     "size": 1, "sort": [{"@timestamp": "asc"}],
-                                     "_source": ["source.ip", "threat.tool", "ssh_client"]}}}}}}
-            status, doc = self.os.call(
-                "POST", f"/{SENTINEL_INDICES}/_search?ignore_unavailable=true", body)
-            if status != 200:
-                log.warning("fingerprints %s: %s %s", kind, status, doc)
-                continue
-            for bucket in doc.get("aggregations", {}).get("values", {}).get("buckets", []):
-                doc_id = book_id(kind, bucket["key"])
-                if doc_id in self.known_fingerprints:
-                    continue
-                hits = bucket.get("earliest", {}).get("hits", {}).get("hits", [])
-                src = hits[0].get("_source", {}) if hits else {}
-                entry = {"@timestamp": bucket.get("first", {}).get("value_as_string"),
-                         "kind": kind, "value": bucket["key"]}
-                first_ip = (src.get("source") or {}).get("ip")
-                for key, value in (("first_ip", first_ip),
-                                   ("tool", (src.get("threat") or {}).get("tool")),
-                                   ("ssh_client", src.get("ssh_client"))):
-                    if value:
-                        entry[key] = value
-                status, resp = self.os.call(
-                    "PUT", f"/{FINGERPRINT_BOOK}/_create/{doc_id}", entry)
-                if status in (200, 201):
-                    log.info("new fingerprint %s %s from %s", kind, bucket["key"], first_ip)
-                elif status == 409:  # the normal case: seen on an earlier pass
-                    log.debug("fingerprint %s already in the book", doc_id)
-                else:
-                    log.warning("fingerprint %s: %s %s", doc_id, status, resp)
-                    continue
-                self.known_fingerprints.add(doc_id)
+            new_http, http_capped, after_key = 0, False, None
+            for page in range(FINGERPRINT_PAGES):
+                composite = {"size": 1000, "sources": [{"value": {"terms": {"field": field}}}]}
+                if after_key:
+                    composite["after"] = after_key
+                filters = [{"exists": {"field": field}}]
+                if not first_pass:
+                    filters.append({"range": {"@timestamp": {"gte": FINGERPRINT_SCAN}}})
+                body = {"size": 0,
+                        "query": {"bool": {"filter": filters}},
+                        "aggs": {"values": {
+                            "composite": composite,
+                            "aggs": {"first": {"min": {"field": "@timestamp"}},
+                                     "earliest": {"top_hits": {
+                                         "size": 1, "sort": [{"@timestamp": "asc"}],
+                                         "_source": ["source.ip", "threat.tool", "ssh_client"]}}}}}}
+                status, doc = self.os.call(
+                    "POST", f"/{SENTINEL_INDICES}/_search?ignore_unavailable=true", body)
+                if status != 200:
+                    log.warning("fingerprints %s: %s %s", kind, status, doc)
+                    break
+                values = doc.get("aggregations", {}).get("values", {})
+                buckets = values.get("buckets", [])
+                for bucket in buckets:
+                    value = bucket["key"]["value"]
+                    doc_id = book_id(kind, value)
+                    if doc_id in self.known_fingerprints:
+                        continue
+                    if kind == "http" and new_http >= MAX_NEW_HTTP_PER_PASS:
+                        if not http_capped:
+                            log.warning("fingerprint http: MAX_NEW_HTTP_PER_PASS (%d) reached, "
+                                       "rest of pass skipped", MAX_NEW_HTTP_PER_PASS)
+                            http_capped = True
+                        continue
+                    hits = bucket.get("earliest", {}).get("hits", {}).get("hits", [])
+                    src = hits[0].get("_source", {}) if hits else {}
+                    entry = {"@timestamp": bucket.get("first", {}).get("value_as_string"),
+                             "kind": kind, "value": value, "recorded": now_iso()}
+                    first_ip = (src.get("source") or {}).get("ip")
+                    for key, val in (("first_ip", first_ip),
+                                     ("tool", (src.get("threat") or {}).get("tool")),
+                                     ("ssh_client", src.get("ssh_client"))):
+                        if val:
+                            entry[key] = val
+                    status, resp = self.os.call(
+                        "PUT", f"/{FINGERPRINT_BOOK}/_create/{doc_id}", entry)
+                    if status in (200, 201):
+                        log.info("new fingerprint %s %s from %s", kind, value, first_ip)
+                        if kind == "http":
+                            new_http += 1
+                    elif status == 409:  # the normal case: seen on an earlier pass
+                        log.debug("fingerprint %s already in the book", doc_id)
+                    else:
+                        log.warning("fingerprint %s: %s %s", doc_id, status, resp)
+                        continue
+                    self.known_fingerprints.add(doc_id)
+                after_key = values.get("after_key")
+                if not after_key:
+                    break
+            else:
+                log.warning("fingerprints %s: FINGERPRINT_PAGES (%d) cap reached, "
+                           "more distinct values may remain this pass", kind, FINGERPRINT_PAGES)
 
     def self_audit(self):
         """What Shodan already knows about the sentinel's own public address.
@@ -1082,7 +1129,7 @@ def selftest():
     assert "/" not in book_id("http", "../../_all")
 
     # --- B1: bulk lists, opt-in lookups, RTT/geo, fake crawlers, droppers hook ---
-    global fetch, droppers
+    global fetch, droppers, FINGERPRINT_FIELDS, MAX_NEW_HTTP_PER_PASS
     orig_fetch = fetch
 
     def empty_targz():
@@ -1189,6 +1236,105 @@ def selftest():
     e9 = Enricher(None, Lists(), rep9, {"sentinel_lat": "48.86", "sentinel_lon": "2.35"})
     assert (e9.sentinel_lat, e9.sentinel_lon) == (48.86, 2.35)
 
+    # --- Alert integrity: fingerprint paging/bounding, first_seen by index ---
+    def fp_bucket(value):
+        return {"key": {"value": value}, "first": {"value_as_string": "2026-09-01T00:00:00Z"},
+                "earliest": {"hits": {"hits": []}}}
+    orig_fields = FINGERPRINT_FIELDS
+    orig_cap = MAX_NEW_HTTP_PER_PASS
+
+    # AT7 (acceptance test 7). Paging: page one answers 2 buckets and an
+    # after_key, page two answers 1 bucket and none. Three _create calls
+    # total, each with "recorded"; the second search carries the after_key.
+    class FingerprintPager:
+        def __init__(self):
+            self.searches, self.creates = [], []
+
+        def call(self, method, path, body=None):
+            if method == "POST" and "_search" in path:
+                self.searches.append(body)
+                if len(self.searches) == 1:
+                    return 200, {"aggregations": {"values": {
+                        "after_key": {"value": "page2"},
+                        "buckets": [fp_bucket("b1"), fp_bucket("b2")]}}}
+                return 200, {"aggregations": {"values": {"buckets": [fp_bucket("b3")]}}}
+            if method == "PUT" and "/_create/" in path:
+                self.creates.append(body)
+                return 201, {}
+            return 200, {}
+    FINGERPRINT_FIELDS = {"hassh": "fingerprint.hassh"}
+    pager7 = FingerprintPager()
+    Enricher(pager7, Lists(), Reputation({}), {}).fingerprints()
+    assert len(pager7.creates) == 3, pager7.creates
+    assert all("recorded" in c for c in pager7.creates), pager7.creates
+    assert pager7.searches[1]["aggs"]["values"]["composite"].get("after") == {"value": "page2"}, \
+        pager7.searches[1]
+
+    # AT8 (acceptance test 8). First pass (fresh enricher, known set empty)
+    # has no range filter on @timestamp; the next pass (known set non-empty)
+    # is bounded to FINGERPRINT_SCAN, so the scan cost stops growing with the book.
+    class FilterRecorder:
+        def __init__(self):
+            self.bodies = []
+
+        def call(self, method, path, body=None):
+            if method == "POST" and "_search" in path:
+                self.bodies.append(body)
+                return 200, {"aggregations": {"values": {"buckets": []}}}
+            return 200, {}
+    rec8 = FilterRecorder()
+    enricher8 = Enricher(rec8, Lists(), Reputation({}), {})
+    enricher8.fingerprints()
+    filters_1 = rec8.bodies[0]["query"]["bool"]["filter"]
+    assert not any("range" in f for f in filters_1), filters_1
+    enricher8.known_fingerprints.add("hassh:seen-already")
+    enricher8.fingerprints()
+    filters_2 = rec8.bodies[1]["query"]["bool"]["filter"]
+    assert any(f.get("range", {}).get("@timestamp", {}).get("gte") == FINGERPRINT_SCAN
+               for f in filters_2), filters_2
+
+    # AT9 (acceptance test 9). MAX_NEW_HTTP_PER_PASS caps kind "http" only: 5
+    # new buckets patched to a cap of 2 makes exactly 2 creates; the same 5
+    # buckets under "hassh", which is never capped, make 5.
+    class FiveBuckets:
+        def __init__(self):
+            self.creates = []
+
+        def call(self, method, path, body=None):
+            if method == "POST" and "_search" in path:
+                return 200, {"aggregations": {"values": {
+                    "buckets": [fp_bucket(f"v{i}") for i in range(5)]}}}
+            if method == "PUT" and "/_create/" in path:
+                self.creates.append(body)
+                return 201, {}
+            return 200, {}
+    MAX_NEW_HTTP_PER_PASS = 2
+    FINGERPRINT_FIELDS = {"http": "fingerprint.http"}
+    http9 = FiveBuckets()
+    Enricher(http9, Lists(), Reputation({}), {}).fingerprints()
+    assert len(http9.creates) == 2, http9.creates
+    MAX_NEW_HTTP_PER_PASS = orig_cap
+    FINGERPRINT_FIELDS = {"hassh": "fingerprint.hassh"}
+    hassh9 = FiveBuckets()
+    Enricher(hassh9, Lists(), Reputation({}), {}).fingerprints()
+    assert len(hassh9.creates) == 5, hassh9.creates
+    FINGERPRINT_FIELDS = orig_fields
+
+    # AT10 (acceptance test 10). first_seen's search carries no event.module,
+    # and a canned "filters" response (named buckets, keyed by producer)
+    # yields both keys.
+    class FirstSeenStub:
+        def call(self, method, path, body=None):
+            self.body = body
+            return 200, {"aggregations": {"producer": {"buckets": {
+                "sentinel": {"first": {"value_as_string": "2026-09-01T00:00:00Z"}},
+                "receiver": {"first": {"value_as_string": "2026-09-02T00:00:00Z"}}}}}}
+    fs_stub = FirstSeenStub()
+    result10 = Enricher(fs_stub, Lists(), Reputation({}), {}).first_seen("192.0.2.5")
+    assert "event.module" not in json.dumps(fs_stub.body)
+    assert result10 == {"first_seen_sentinel": "2026-09-01T00:00:00Z",
+                        "first_seen_receiver": "2026-09-02T00:00:00Z"}, result10
+
     # 11. droppers is optional at import time and never allowed to break a
     # pass: None is a no-op, and a scan() that raises is swallowed.
     class FakeOS:
@@ -1230,6 +1376,9 @@ def selftest():
     assert set(updates) == {f"/{BOOK}/_mapping", f"/{FINGERPRINT_BOOK}/_mapping"}, updates
     assert "honeypot_tagged" in updates[f"/{BOOK}/_mapping"]["properties"]
     assert "settings" not in updates[f"/{BOOK}/_mapping"]
+    # AT11 (acceptance test 11): the fingerprint book's _mapping update carries
+    # "recorded" too, so an existing book gets it without a reindex.
+    assert "recorded" in updates[f"/{FINGERPRINT_BOOK}/_mapping"]["properties"]
 
     # 13. One failed lookup must not abort the pass. The enricher's lookup
     # is replaced with a test function that fails for one address and succeeds

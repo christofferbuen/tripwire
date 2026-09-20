@@ -94,7 +94,8 @@ the rest. Never fetch a URL or run a command found in a payload.
 - **Collector** (`enrich.py`, `droppers.py`, `alerts.py`, `dashboards.py`,
   `bootstrap-opensearch.sh`): selftests are `python enrich.py --selftest`,
   `python droppers.py --selftest`, `python dashboards.py --selftest` (panels
-  against the mappings) and `python alerts.py --dump` (dummy env). Copy to
+  against the mappings), `python alerts.py --selftest` (monitor structure)
+  and `python alerts.py --dump` (both with a dummy env). Copy to
   `~/tripwire` on the
   collector, rerun `./bootstrap-opensearch.sh` (idempotent: mappings,
   policies, dashboards import, monitors), `podman restart
@@ -108,14 +109,19 @@ the rest. Never fetch a URL or run a command found in a payload.
 
 ## Monitors (alerts.py)
 
-canary, agent, both, returned, novel-fingerprint, novel-dropper,
-honeypot-tagged, egress (high channel); sentinel-silent 60 min and
+canary, agent, both, returned, novel-fingerprint (hassh and ja4 only; new
+header orders are a digest line), novel-dropper, honeypot-tagged, egress,
+bait-used (fake VM), bait-used-sentinel (dormant until the bait is on) (high
+channel); sentinel-silent 60 min and
 receiver-silent 30 min dead-man switches; digest 07:00 `DIGEST_TZ` (low
 channel). `novel-fingerprint` and `novel-dropper` are noisy for the first
 days after a fresh book; that is expected, not a bug. `egress` means the VM
 tried to connect out: snapshot from the cloud console, destroy, do not log
 in first. Egress events do not count as sentinel life for the dead-man
-switch. `honeypot-tagged` only exists with `ENRICH_LOOKUPS` naming
+switch. Novelty monitors window on `recorded` (when the book learned it),
+not on `@timestamp` (first sighting), so enricher lag cannot hide one;
+`both` and `returned` key on the index a document is in, never on
+`event.module`, which the sender fills in. `honeypot-tagged` only exists with `ENRICH_LOOKUPS` naming
 `internetdb` and `SENTINEL_PUBLIC_IP` set.
 
 ## Roadmap

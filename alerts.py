@@ -115,10 +115,11 @@ def action(message, throttle_minutes=None, per_alert=False, channel_id=CHANNEL_I
 def query_monitor(name, indices, filters, trigger_name, severity, message,
                   minutes=5, size=5, condition="ctx.results[0].hits.total.value > 0",
                   throttle_minutes=None, aggs=None, schedule=None,
-                  channel_id=CHANNEL_ID, time_field="@timestamp"):
-    search = {"size": size, "sort": [{time_field: "desc"}],
-              "query": {"bool": {"filter": filters
-                                 + [window(minutes, time_field)]}}}
+                  channel_id=CHANNEL_ID, time_field="@timestamp", must_not=None):
+    query = {"bool": {"filter": filters + [window(minutes, time_field)]}}
+    if must_not:
+        query["bool"]["must_not"] = must_not
+    search = {"size": size, "sort": [{time_field: "desc"}], "query": query}
     if aggs:
         search["aggs"] = aggs
     if throttle_minutes is None:
@@ -151,12 +152,15 @@ def top(field, size=3):
 
 
 DIGEST_AGGS = {"by": {
+    # Keyed on which index wrote the document, not on event.module: that
+    # field is sender-filled, and the sentinel's writer account has no scope
+    # to put anything in tripwire-hits-* regardless of what it claims.
     "filters": {"filters": {
         "receiver": {"bool": {
-            "filter": [{"term": {"event.module": "receiver"}}],
+            "filter": [{"prefix": {"_index": "tripwire-hits-"}}],
             "must_not": [{"term": {"http.user_agent": HEARTBEAT_AGENT}}]}},
         "sentinel": {"bool": {
-            "filter": [{"term": {"event.module": "sentinel"}}],
+            "filter": [{"prefix": {"_index": "tripwire-sentinel-"}}],
             "must_not": [{"term": {"classification": "egress-blocked"}}]}}}},
     "aggs": {"ips": {"cardinality": {"field": "source.ip"}},
              "cc": top("source.geo.country_iso_code"),
@@ -173,10 +177,17 @@ DIGEST_AGGS = {"by": {
              "held_min": {"bucket_script": {"buckets_path": {"h": "held"},
                                             "script": "Math.round(params.h/60000)",
                                             "format": "0"}}}},
-    # Ledger documents carry no event.module, so they land in neither bucket
-    # above; their @timestamp is the event that first named the location.
+    # Ledger documents live in their own index, so they land in neither
+    # bucket above; their @timestamp is the event that first named the
+    # location.
     "droppers": {"filter": {"prefix": {"_index": "dropper-book"}}},
-    "fakevm": {"filter": {"term": {"event.module": "fakevm"}},
+    # Same idea as "new dropper locations" just below: a count of what the
+    # fingerprint book recorded today, kind http only (hassh/ja4 already
+    # have their own novelty alert; this is the noisy one worth a headline
+    # number instead).
+    "fingerprints_http": {"filter": {"bool": {"filter": [
+        {"prefix": {"_index": "fingerprint-book"}}, {"term": {"kind": "http"}}]}}},
+    "fakevm": {"filter": {"prefix": {"_index": "tripwire-fakevm-"}},
                "aggs": {"starts": {"filter": {"term": {"fakevm.status": "start"}}},
                         "interactions": {"filter": {"term": {"fakevm.status": "interaction"}}}}}}
 
@@ -197,6 +208,7 @@ DIGEST_MESSAGE = (
     "{{rtt_odd.ips.value}} addresses\n"
     "{{/ctx.results.0.aggregations.by.buckets.sentinel}}"
     "New dropper locations: {{ctx.results.0.aggregations.droppers.doc_count}}\n"
+    "New header orders: {{ctx.results.0.aggregations.fingerprints_http.doc_count}}\n"
     "Fake VM: {{ctx.results.0.aggregations.fakevm.starts.doc_count}} starts, "
     "{{ctx.results.0.aggregations.fakevm.interactions.doc_count}} interactions")
 
@@ -208,6 +220,13 @@ FINGERPRINTS = ["fingerprint-book"]
 DROPPERS = ["dropper-book"]
 ADDRESSES = ["address-book"]
 EGRESS = {"term": {"classification": "egress-blocked"}}
+# The novelty monitors below key their window on "recorded" (when the book
+# learned it, stamped by the enricher) rather than "@timestamp" (first
+# sighting). This filter is the second half of that fix: it keeps a rebuilt
+# book, which restamps "recorded" for months of old history in one pass,
+# from alerting on any of it.
+RECENT_24H = {"range": {"@timestamp": {"gte": "{{period_end}}||-24h",
+                                       "format": "epoch_millis"}}}
 
 MONITORS = [
     query_monitor(
@@ -216,6 +235,17 @@ MONITORS = [
         "Bait credential used in the fake SSH service.\n"
         "{{#ctx.results.0.hits.hits}}"
         "{{_source.source.ip}} session={{_source.fakevm.session}}\n"
+        "{{/ctx.results.0.hits.hits}}"),
+    # Same alert as tripwire-bait-used, on the sentinel's own SSH persona
+    # rather than the fake VM. Dormant until the bait is switched on there.
+    query_monitor(
+        "tripwire-bait-used-sentinel", SENTINEL,
+        [{"term": {"bait.credential_used": True}}],
+        "bait credential used", "1",
+        "Bait credential used on the sentinel.\n"
+        "{{#ctx.results.0.hits.hits}}"
+        "{{_source.source.ip}} {{_source.source.geo.country_iso_code}} "
+        "port {{_source.port}}\n"
         "{{/ctx.results.0.hits.hits}}"),
     query_monitor(
         "tripwire-canary", HITS, [{"exists": {"field": "canary"}}],
@@ -238,19 +268,27 @@ MONITORS = [
         "type": "monitor", "name": "tripwire-both",
         "monitor_type": "bucket_level_monitor", "enabled": True,
         "schedule": {"period": {"interval": 5, "unit": "MINUTES"}},
+        # by_ip's sub-aggregations are keyed on which index each hit came
+        # from, not on event.module: that field is sender-filled, and the
+        # sentinel's writer account has no scope to put anything in
+        # tripwire-hits-* regardless of what it claims. The heartbeat is
+        # excluded so the collector's own 10-minute fetch of its own site
+        # can never be half of a pair.
         "inputs": [{"search": {"indices": HITS + SENTINEL, "query": {
             "size": 0,
-            "query": {"bool": {"filter": [window(60)]}},
+            "query": {"bool": {"filter": [window(60)],
+                               "must_not": [{"term": {"http.user_agent": HEARTBEAT_AGENT}}]}},
             "aggregations": {"by_ip": {
                 "composite": {"size": 500, "sources": [
                     {"ip": {"terms": {"field": "source.ip"}}}]},
-                "aggregations": {"modules": {
-                    "cardinality": {"field": "event.module"}}}}}}}}],
+                "aggregations": {
+                    "hits": {"filter": {"prefix": {"_index": "tripwire-hits-"}}},
+                    "sentinel": {"filter": {"prefix": {"_index": "tripwire-sentinel-"}}}}}}}}}],
         "triggers": [{"bucket_level_trigger": {
             "name": "scanned then knocked", "severity": "2",
-            "condition": {"buckets_path": {"modules": "modules"},
+            "condition": {"buckets_path": {"hits": "hits>_count", "sentinel": "sentinel>_count"},
                           "parent_bucket_path": "by_ip",
-                          "script": {"source": "params.modules > 1",
+                          "script": {"source": "params.hits > 0 && params.sentinel > 0",
                                      "lang": "painless"}},
             "actions": [action(
                 "Scanned the sentinel and hit the receiver within an hour: "
@@ -286,7 +324,11 @@ MONITORS = [
         "is down."),
     # prior.sentinel_hours is stamped by the enricher on receiver events only,
     # and only when the sentinel saw the address first; the gte 1 keeps out the
-    # same-visit noise tripwire-both already covers.
+    # same-visit noise tripwire-both already covers. The window keys on
+    # enrichment.at (stamped in the same update that writes prior.*) rather
+    # than @timestamp, so a slow enricher pass cannot push the record outside
+    # the window before this monitor ever runs over it. Heartbeat excluded,
+    # same reason as tripwire-both.
     query_monitor(
         "tripwire-returned", HITS,
         [{"range": {"prior.sentinel_hours": {"gte": 1}}}],
@@ -296,34 +338,42 @@ MONITORS = [
         "{{_source.source.ip}} {{_source.source.geo.country_iso_code}} "
         "{{_source.tier_name}} {{_source.method}} {{_source.path}}, "
         "{{_source.prior.sentinel_hours}} h after first sentinel contact\n"
-        "{{/ctx.results.0.hits.hits}}"),
-    # Every document in the book is a first sighting, and its @timestamp is
-    # when that sighting happened, so the window filter alone is the novelty
-    # test: a fingerprint indexed today for a stack first seen last month
-    # stays quiet, which is what it should do.
+        "{{/ctx.results.0.hits.hits}}",
+        time_field="enrichment.at",
+        must_not=[{"term": {"http.user_agent": HEARTBEAT_AGENT}}]),
+    # recorded is stamped when the enricher writes the book entry; @timestamp
+    # stays "the first time this stack knocked". Keying the window on
+    # recorded, not @timestamp, means a slow enricher pass (a restart, a
+    # backlog) cannot push the record outside this monitor's window before
+    # anyone sees it. The added @timestamp range keeps a rebuilt book, which
+    # restamps recorded for months of old history in one pass, from alerting
+    # on any of it. hassh/ja4 only: fingerprint.http's value space is
+    # attacker-chosen and unbounded, so it gets its own count in the digest
+    # instead of a per-value alert.
     query_monitor(
-        "tripwire-novel-fingerprint", FINGERPRINTS, [],
+        "tripwire-novel-fingerprint", FINGERPRINTS,
+        [{"terms": {"kind": ["hassh", "ja4"]}}, RECENT_24H],
         "fingerprint not seen before", "3",
         "New client fingerprint.\n"
         "{{#ctx.results.0.hits.hits}}"
         "{{_source.kind}} {{_source.value}} {{_source.first_ip}} "
         "{{_source.tool}} {{_source.ssh_client}}\n"
         "{{/ctx.results.0.hits.hits}}",
-        throttle_minutes=5),
-    # Same novelty test as the fingerprint book: @timestamp is the event that
-    # first named the location, so the window has to cover the enricher's
-    # scan lag as well, and the throttle keeps that wider window from
-    # repeating. Only the defanged form goes into a message, so nothing
-    # downstream turns it into a link.
+        time_field="recorded", throttle_minutes=5),
+    # Same fix as the fingerprint book above: recorded is the window (the
+    # throttle keeps that wider window from repeating), and the @timestamp
+    # range keeps a rebuilt ledger quiet about old locations. Only the
+    # defanged form goes into a message, so nothing downstream turns it into
+    # a link.
     query_monitor(
-        "tripwire-novel-dropper", DROPPERS, [],
+        "tripwire-novel-dropper", DROPPERS, [RECENT_24H],
         "dropper location not seen before", "3",
         "New second-stage location (defanged, never fetch it).\n"
         "{{#ctx.results.0.hits.hits}}"
         "{{_source.kind}} {{_source.url_defanged}} from "
         "{{_source.first_source_ip}}\n"
         "{{/ctx.results.0.hits.hits}}",
-        minutes=30),
+        time_field="recorded", minutes=30),
     # The enricher rewrites the address-book document "self" once a day with
     # what InternetDB says about the sentinel's own address, and `checked` is
     # that document's clock. 26 h so one late pass does not open a gap.
@@ -337,10 +387,12 @@ MONITORS = [
         "{{/ctx.results.0.hits.hits}}",
         minutes=26 * 60, size=1, throttle_minutes=24 * 60, time_field="checked",
         schedule={"period": {"interval": 60, "unit": "MINUTES"}}),
-    # dropper-book* rather than the bare name: a wildcard that matches
-    # nothing is not an error, a missing index would cost the whole digest.
+    # dropper-book* and fingerprint-book* rather than the bare names: a
+    # wildcard that matches nothing is not an error, a missing index would
+    # cost the whole digest.
     query_monitor(
-        "tripwire-digest", HITS + SENTINEL + FAKEVM + ["dropper-book*"], [], "daily",
+        "tripwire-digest",
+        HITS + SENTINEL + FAKEVM + ["dropper-book*", "fingerprint-book*"], [], "daily",
         "5", DIGEST_MESSAGE,
         minutes=24 * 60, size=0, condition="true", throttle_minutes=0,
         aggs=DIGEST_AGGS, channel_id=DIGEST_CHANNEL_ID,
@@ -406,7 +458,85 @@ def test_channel():
     print("  test message delivered" if ok else f"  test message failed: {status} {body}")
 
 
+def selftest():
+    """Everything MONITORS declares is a literal, so all of this is checked
+    by reading the structure, no cluster needed -- the same reason --dump
+    works without one."""
+    dump = json.dumps(MONITORS)
+
+    # 1. Names are unique, and every monitor that existed before this
+    # package still exists. tripwire-bait-used is the fake VM's twin of the
+    # new tripwire-bait-used-sentinel; CLAUDE.md's monitor list predates it.
+    names = [m["name"] for m in MONITORS]
+    assert len(names) == len(set(names)), names
+    before = {"tripwire-bait-used", "tripwire-canary", "tripwire-agent",
+              "tripwire-both", "tripwire-egress", "tripwire-sentinel-silent",
+              "tripwire-receiver-silent", "tripwire-returned",
+              "tripwire-novel-fingerprint", "tripwire-novel-dropper",
+              "tripwire-honeypot-tagged", "tripwire-digest"}
+    assert before <= set(names), before - set(names)
+    assert "tripwire-bait-used-sentinel" in names
+
+    by_name = {m["name"]: m for m in MONITORS}
+
+    # 2. tripwire-novel-fingerprint: window on recorded, kind in [hassh, ja4],
+    # an @timestamp -24h range. Same window and -24h check for the dropper.
+    fp = by_name["tripwire-novel-fingerprint"]
+    fp_query = fp["inputs"][0]["search"]["query"]
+    assert "recorded" in fp_query["query"]["bool"]["filter"][-1]["range"], fp_query
+    assert fp_query["sort"] == [{"recorded": "desc"}], fp_query["sort"]
+    filters = fp_query["query"]["bool"]["filter"]
+    kind_terms = [f["terms"]["kind"] for f in filters if "terms" in f and "kind" in f["terms"]]
+    assert kind_terms == [["hassh", "ja4"]], kind_terms
+    assert any("@timestamp" in f.get("range", {}) and
+              "-24h" in f["range"]["@timestamp"]["gte"] for f in filters), filters
+
+    dr = by_name["tripwire-novel-dropper"]
+    dr_query = dr["inputs"][0]["search"]["query"]
+    assert "recorded" in dr_query["query"]["bool"]["filter"][-1]["range"], dr_query
+    assert dr_query["sort"] == [{"recorded": "desc"}], dr_query["sort"]
+    dr_filters = dr_query["query"]["bool"]["filter"]
+    assert any("@timestamp" in f.get("range", {}) and
+              "-24h" in f["range"]["@timestamp"]["gte"] for f in dr_filters), dr_filters
+
+    # 3. tripwire-returned: window on enrichment.at, sorted the same way,
+    # heartbeat excluded.
+    ret = by_name["tripwire-returned"]
+    ret_query = ret["inputs"][0]["search"]["query"]
+    assert ret_query["sort"] == [{"enrichment.at": "desc"}], ret_query["sort"]
+    assert any("enrichment.at" in f.get("range", {}) for f in ret_query["query"]["bool"]["filter"]), \
+        ret_query
+    assert {"term": {"http.user_agent": HEARTBEAT_AGENT}} in ret_query["query"]["bool"]["must_not"]
+
+    # 4. tripwire-both: no event.module anywhere in it, both _index prefixes
+    # present, heartbeat excluded.
+    both = by_name["tripwire-both"]
+    both_dump = json.dumps(both)
+    assert "event.module" not in both_dump, both_dump
+    assert "tripwire-hits-" in both_dump and "tripwire-sentinel-" in both_dump
+    both_query = both["inputs"][0]["search"]["query"]["query"]
+    assert {"term": {"http.user_agent": HEARTBEAT_AGENT}} in both_query["bool"]["must_not"]
+
+    # 5. tripwire-bait-used-sentinel exists, severity 1, sentinel indices,
+    # and never prints attacker-supplied bodies or commands.
+    bait = by_name["tripwire-bait-used-sentinel"]
+    assert bait["triggers"][0]["query_level_trigger"]["severity"] == "1", bait
+    assert bait["inputs"][0]["search"]["indices"] == SENTINEL, bait
+    message = bait["triggers"][0]["query_level_trigger"]["actions"][0]["message_template"]["source"]
+    for forbidden in ("http_body", "http_requests", "smtp_commands", "payload"):
+        assert forbidden not in message, (forbidden, message)
+
+    # 6. event.module appears nowhere in any monitor, including the digest,
+    # which used to key its receiver/sentinel/fakevm split on it.
+    assert "event.module" not in dump, "event.module still present in MONITORS"
+
+    print("selftest ok")
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        selftest()
+        sys.exit(0)
     if "--dump" in sys.argv:
         # Everything above is a literal; printing it needs no cluster, so the
         # monitor definitions can be read and diffed away from the deployment.

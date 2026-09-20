@@ -25,6 +25,7 @@ import logging
 import re
 import sys
 import urllib.parse
+from datetime import datetime, timezone
 
 INDICES = "tripwire-sentinel-*,tripwire-hits-*,tripwire-fakevm-*"
 FIELDS = ("http_body", "payload_text", "http_requests", "body_excerpt", "path", "fakevm.command")
@@ -232,17 +233,33 @@ BOOK_MAPPING = {
             "@timestamp": {"type": "date"},
             "first_source_ip": {"type": "ip"},
             "first_index": {"type": "keyword"},
+            # When the book learned this location, stamped by record().
+            # @timestamp keeps meaning the event's own first sighting.
+            "recorded": {"type": "date"},
         },
     },
 }
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def ensure_book(client):
     status, doc = client.call("PUT", "/" + BOOK, BOOK_MAPPING)
     if status == 200:
         log.info("created index %s", BOOK)
-    elif status != 400 or "already_exists" not in json.dumps(doc):
+        return
+    if status != 400 or "already_exists" not in json.dumps(doc):
         raise RuntimeError(f"cannot create {BOOK}: {status} {doc}")
+    # A book from an older version: creation is the only time the mapping
+    # above is read, so hand it the field it has not got. Additive only; a
+    # refused update (field already exists with another type) is a warning,
+    # not a reason to stop the enricher.
+    status, doc = client.call("PUT", f"/{BOOK}/_mapping",
+                              {"properties": BOOK_MAPPING["mappings"]["properties"]})
+    if status != 200:
+        log.warning("cannot update mapping of %s: %s %s", BOOK, status, doc)
 
 
 def join_fields(src):
@@ -263,7 +280,8 @@ def record(client, item, timestamp, source_ip, index_name):
     error: the first sighting is what matters and it is never overwritten."""
     doc_id = hashlib.sha256(item["url"].encode()).hexdigest()
     entry = {"url": item["url"], "url_defanged": defang(item["url"]),
-              "host": item["host"], "kind": item["kind"], "first_index": index_name}
+              "host": item["host"], "kind": item["kind"], "first_index": index_name,
+              "recorded": now_iso()}
     if "port" in item:
         entry["port"] = item["port"]
     if timestamp:
@@ -445,7 +463,15 @@ def selftest():
     assert updates[0][2]["doc"]["dropper"]["scanned"] is True
     assert "urls" in updates[0][2]["doc"]["dropper"]
     assert "urls" not in updates[1][2]["doc"]["dropper"]
-    assert len([c for c in client.calls if "/_create/" in c[1]]) == 1
+    create_calls = [c for c in client.calls if "/_create/" in c[1]]
+    assert len(create_calls) == 1
+    # Alert integrity acceptance test 12: the ledger entry carries "recorded"
+    # (when the book learned it), and "@timestamp" is still the event's own
+    # timestamp, not now.
+    create_body = create_calls[0][2]
+    assert create_body["@timestamp"] == "2026-09-19T00:00:00Z", create_body
+    assert "recorded" in create_body and create_body["recorded"] != create_body["@timestamp"], \
+        create_body
 
     # 11: partial failure, 409 on _create (already known), 500 on one _update
     hits2 = [
