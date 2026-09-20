@@ -9,6 +9,8 @@ import time
 
 HOST = sys.argv[1]
 MODE = sys.argv[2]
+CUSTOM = bool(os.environ.get('TRIPWIRE_CUSTOM'))
+MODEL_COMMAND = 'ps' if CUSTOM else 'ls'
 PASSWORD = "Deploy-2026.ok+x"  # Synthetic test fixture, never a live bait.
 OPTIONS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
            "-o", "ConnectTimeout=3", "-o", "NumberOfPasswordPrompts=1",
@@ -50,12 +52,13 @@ try:
             check(result.returncode != 0 and b"deploy\n" not in result.stdout,
                   "invalid password refused")
         check(command("whoami").stdout.strip() == b"deploy", "static command")
-        check(command("ls").stdout.strip() == b"STUB-OUTPUT", "model stub command")
-        result = run([*SSH, "-T", "deploy@" + HOST], input=b"whoami\nls\nexit\n")
+        check(command(MODEL_COMMAND).stdout.strip() == b"STUB-OUTPUT", "model stub command")
+        result = run([*SSH, "-T", "deploy@" + HOST], input=('whoami\n'+MODEL_COMMAND+'\nexit\n').encode())
         check(b"deploy" in result.stdout and b"STUB-OUTPUT" in result.stdout,
               "interactive shell")
-        check(command("touch /tmp/tripwire-test-marker; ls /tmp").stdout.strip() == b"STUB-OUTPUT",
-              "shell syntax sent to stub as text")
+        expected_marker = b'tripwire-test-marker' if CUSTOM else b'STUB-OUTPUT'
+        check(command("touch /tmp/tripwire-test-marker; ls /tmp").stdout.strip() == expected_marker,
+              "file command uses virtual state only")
         time.sleep(0.3)
         events = [r["event"] for r in records("/logs/beelzebub.log") if "event" in r]
         check({"Stateless", "Start", "Interaction", "End"} <= {r["Status"] for r in events},
@@ -71,7 +74,7 @@ try:
         requests = records("/logs/stub.jsonl")
         check(all(r["auth"] == "Bearer stub-not-a-real-key" for r in requests), "dummy auth header")
         prompt = Path("/configurations/prompt.txt").read_text().strip()
-        check(all(r["request"]["messages"][0]["content"] == prompt for r in requests),
+        check(all(r["request"]["messages"][0]["content"].startswith(prompt) for r in requests),
               "custom prompt reaches model")
     elif MODE == "forwarding":
         # -W requests an actual direct-tcpip channel (same as a used -L).
@@ -125,7 +128,7 @@ try:
     elif MODE == "rate":
         before = stub_count()
         # One interactive session bursts 11 commands before one token refills.
-        result = run([*SSH, "-T", "deploy@" + HOST], input=b"ls\n" * 11 + b"exit\n")
+        result = run([*SSH, "-T", "deploy@" + HOST], input=(MODEL_COMMAND+'\n').encode() * 11 + b"exit\n")
         check(result.stdout.count(b"STUB-OUTPUT") == 10 and stub_count() - before == 10,
               "11th burst command refused")
     elif MODE == "deadline":
@@ -140,9 +143,48 @@ try:
             if proc.poll() is None:
                 proc.kill()
             proc.communicate()
+    elif MODE == "enhanced":
+        from concurrent.futures import ThreadPoolExecutor
+        before = stub_count()
+        def session(label):
+            text = ('mkdir /tmp/' + label + '\ncd /tmp/' + label +
+                    '\necho ' + label + ' > marker\ncat marker\nps\nexit\n')
+            return run([*SSH, '-T', 'deploy@' + HOST], input=text.encode())
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(session, ['session_alpha', 'session_beta']))
+        for label, result in zip(['session_alpha', 'session_beta'], results):
+            check(result.returncode == 0 and ('deploy@test.invalid:/tmp/' + label + '$').encode() in result.stdout,
+                  'dynamic prompt ' + label)
+        requests = records('/logs/stub.jsonl')[before:]
+        check(len(requests) == 2, 'one model request per concurrent session')
+        for request in requests:
+            text = json.dumps(request['request'])
+            check(('session_alpha' in text) != ('session_beta' in text), 'same-IP concurrent histories isolated')
+        check(command('ls /tmp').stdout.strip() == b'', 'reconnect starts with clean filesystem')
+        check(command('pwd').stdout.strip() == b'/home/deploy', 'reconnect resets directory')
+        before = stub_count()
+        sequence = ''.join('echo history_%d\n' % n for n in range(100)) + 'ps\nexit\n'
+        result = run([*SSH, '-T', 'deploy@' + HOST], input=sequence.encode())
+        check(result.returncode == 0, 'long session completes')
+        messages = records('/logs/stub.jsonl')[before]['request']['messages']
+        check(len(messages) <= 18 and 'history_0' not in json.dumps(messages), 'history bounded and old entries discarded')
+        before = stub_count()
+        result = run([*SSH, '-T', 'deploy@' + HOST], input=b'cd /tmp\nps --tripwire-fail\npwd\nps\nexit\n')
+        check(b'temporarily unavailable' in result.stdout and b'STUB-OUTPUT' in result.stdout,
+              'provider failure recovers without false command-not-found')
+        requests = records('/logs/stub.jsonl')[before:]
+        check(len(requests) == 2 and 'temporarily unavailable' not in json.dumps(requests[-1]),
+              'failed response excluded from history')
+        check('cwd=\\"/tmp\\"' in json.dumps(requests[-1]), 'provider failure preserves directory')
+        started = time.monotonic()
+        result = subprocess.run([*SSH, 'deploy@' + HOST, 'ps --tripwire-slow'],
+                                env=os.environ | {'SSHPASS': PASSWORD}, capture_output=True, timeout=40)
+        check(25 < time.monotonic()-started < 38 and result.returncode == 75 and b'temporarily unavailable' in result.stdout,
+              'stalled provider has bounded deadline and temporary exit status')
+        check(command('pwd').stdout.strip() == b'/home/deploy', 'shell available after timeout')
     elif MODE == "no-key":
         before = stub_count()
-        check(b"STUB-OUTPUT" not in command("ls").stdout, "missing key refuses model call")
+        check(b"STUB-OUTPUT" not in command(MODEL_COMMAND).stdout, "missing key refuses model call")
         check(stub_count() == before, "no request without a key")
     else:
         raise ValueError("unknown mode")

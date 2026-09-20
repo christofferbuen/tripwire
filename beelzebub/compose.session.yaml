@@ -1,0 +1,7 @@
+# Build with build-engine.py, load as the fakevm user, and record the immutable
+# local image ID in the deployment's private .env. Never pull a mutable tag.
+services:
+  fakevm:
+    image: ${FAKEVM_SESSION_IMAGE:?set the loaded sha256 image ID}
+    environment:
+      TRIPWIRE_SHELL: "1"

@@ -3,6 +3,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import threading
+import time
 
 LOCK = threading.Lock()
 
@@ -18,6 +19,12 @@ class Stub(BaseHTTPRequestHandler):
             # This is always a deliberately fake credential.
             stream.write(json.dumps({"auth": self.headers.get("Authorization"),
                                      "request": request}) + "\n")
+        command = request['messages'][-1]['content']
+        if command == 'ps --tripwire-fail':
+            self.send_error(503)
+            return
+        if command == 'ps --tripwire-slow':
+            time.sleep(36)
         response = json.dumps({"choices": [{"message": {
             "role": "assistant", "content": "STUB-OUTPUT"}}]}).encode()
         self.send_response(200)

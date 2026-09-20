@@ -99,6 +99,29 @@ No claim of production client-IP preservation follows from a tunneled test.
 
 ## Public launch remains separate
 
+The private engine now runs the tested session overlay on pinned upstream
+v3.9.1. Its immutable loaded image ID is
+`sha256:b60369cc6306e0ca51d40a46c03360adda42e5fdbe612b9dc8d7c7a368797be9`.
+Session-owned bounded virtual files, working directory and history replace
+shared IP/user context; the prompt follows `cd`. Provider failures produce a
+temporary error, stay out of history and preserve virtual state. Client calls
+inherit SSH cancellation and a 32-second deadline. The gateway's tighter
+bounds remain active.
+
+Local real-SSH tests passed concurrent same-IP/user isolation, clean reconnects,
+a 100-command session, bounded history, failed-provider recovery and a stalled
+provider deadline, plus the prior authentication/forwarding/transfer checks.
+The live rollout verified two simultaneous sessions and one fresh reconnect,
+then checked all 35 events / 29 command-output pairs in OpenSearch. Initial
+smoke verification exposed asynchronous upstream log ordering; configuration
+rollback worked, and the verifier now compares exact pair multiplicities.
+No model/session payload was exported from private deployment diagnostics.
+
+Post-rollout checks confirmed the original sentinel container identity, running
+gateway/relay/Vector, loopback-only SSH, internal engine network, read-only root,
+valid admin SSH configuration and the existing provider cap. Supported shell
+syntax and remaining limitations are documented in `beelzebub/engine/README.md`.
+
 Follow-up private evaluation: the gateway now disables provider reasoning,
 accepts intentionally silent stopped responses, rejects token truncation,
 escapes terminal control characters and trims complete history pairs. Removed

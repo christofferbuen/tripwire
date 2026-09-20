@@ -1,5 +1,31 @@
 # Fake SSH: local preparation
 
+## Current private engine
+
+The private deployment now uses the opt-in [session engine](engine/README.md)
+built on pinned upstream v3.9.1. Common shell commands use deterministic,
+bounded in-memory files and directories, and the prompt follows `cd`. Every
+SSH channel owns its state and bounded model history; reconnects start fresh.
+Model failures return a temporary error without changing state or entering
+history. Model requests have SSH cancellation and a client deadline.
+
+Live validation passed two concurrent same-IP/user sessions plus a fresh
+reconnect: **35 events and 29 exact command/output pairs** verified in OpenSearch.
+The separate local SSH suite passed a 100-command session, history isolation,
+provider failure/recovery, stalled-provider deadline, and existing forwarding/
+transfer rejection checks. All ten Vector transform tests passed for new logs.
+
+This is a shell subset, not full Bash: pipelines, command substitution, scripts,
+globbing and general environment assignment remain unsupported. Files last
+only for the session. The original sentinel, admin SSH and private networking
+are unchanged. Public exposure and reboot testing remain separate.
+
+The sections below preserve the earlier upstream-only evaluation; its shared
+history and fixed-prompt limitations are superseded **only when the custom
+session overlay is enabled**. See the engine README for build and rollout steps.
+
+## Earlier private baseline
+
 Private deployment is running on the sentinel under a separate Unix account,
 with loopback-only SSH and an internal container network. Collector integration
 is deployed. A real interactive SSH test was verified in live OpenSearch:
@@ -32,7 +58,8 @@ terminal control characters, auth, response limits, deadlines and overload.
 Gateway diagnostics contain status/error types only, never session content.
 Run `test-gateway.py` in a Linux helper; the smoke client's `--state` and
 `--semantics` modes use the approved private deployment and paid model.
-The default smoke test also now needs the model for `pwd`.
+The upstream-only default smoke test needs the model for `pwd`; the custom
+session engine handles `pwd` locally.
 
 From the repository root (Python standard library and Podman):
 

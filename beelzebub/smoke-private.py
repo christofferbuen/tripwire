@@ -17,7 +17,7 @@ def main():
     parser.add_argument('--state', action='store_true', help='Check directory changes and silent commands through the model')
     parser.add_argument('--refresh-host-key', action='store_true', help='Reset only the generated smoke-test known-hosts file after an approved engine recreation')
     args = parser.parse_args()
-    commands = ['ls /var/www'] if args.model else ['whoami', 'pwd', 'id']
+    commands = ['uptime'] if args.model else ['whoami', 'pwd', 'id']
     if args.semantics:
         commands = ['hello', 'tripwire_no_such_command', 'echo hello', "printf '%s\\n' tripwire", 'ls /var/www']
     if args.state:

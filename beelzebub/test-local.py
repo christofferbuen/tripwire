@@ -5,6 +5,7 @@ No host ports, no real key, no deployment. Unique resources are removed on
 exit. Uses podman cp rather than host mounts to support Windows remote Podman.
 """
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -14,7 +15,8 @@ import uuid
 
 from render import HERE, PERSONAS, selftest, write_config
 
-IMAGE = "docker.io/m4r10/beelzebub:v3.9.1@sha256:f8e6acbc67a3838a9aa52c0473ac20e04aed8be02e1f131d6188acc0b6ff17f7"
+IMAGE = os.environ.get('TRIPWIRE_TEST_IMAGE', "docker.io/m4r10/beelzebub:v3.9.1@sha256:f8e6acbc67a3838a9aa52c0473ac20e04aed8be02e1f131d6188acc0b6ff17f7")
+CUSTOM = bool(os.environ.get('TRIPWIRE_TEST_IMAGE'))
 
 
 def podman(*args, check=True, timeout=180):
@@ -28,7 +30,7 @@ def podman(*args, check=True, timeout=180):
 def main():
     selftest()
     podman("info")
-    podman("pull", IMAGE)
+    if not CUSTOM: podman("pull", IMAGE)
     helper_image = "localhost/tripwire-beelzebub-test:local"
     print("Building disposable SSH client and model stub", flush=True)
     podman("build", "-t", helper_image, "-f", HERE / "tests/Containerfile", HERE / "tests", timeout=300)
@@ -66,6 +68,8 @@ def main():
                         "-v", config + ":/configurations:ro", "-v", logs + ":/logs"]
                 if key:
                     args += ["-e", "OPEN_AI_SECRET_KEY=stub-not-a-real-key"]
+                if CUSTOM:
+                    args += ["-e", "TRIPWIRE_SHELL=1"]
                 podman(*args, IMAGE)
                 created_containers.append(engine)
                 info = json.loads(podman("inspect", engine).stdout)[0]
@@ -83,7 +87,7 @@ def main():
                 created_containers.remove(engine)
 
             def client(address, mode):
-                result = podman("exec", helper, "python3", "/tests/client.py", address, mode, timeout=45)
+                result = podman("exec", "-e", "TRIPWIRE_CUSTOM=" + ('1' if CUSTOM else ''), helper, "python3", "/tests/client.py", address, mode, timeout=90)
                 print(result.stdout, end="", flush=True)
 
             configure()
@@ -120,6 +124,11 @@ def main():
             address = start()
             client(address, "deadline")
             stop()
+            if CUSTOM:
+                configure()
+                address = start()
+                client(address, "enhanced")
+                stop()
             configure()
             address = start(key=False)
             client(address, "no-key")
